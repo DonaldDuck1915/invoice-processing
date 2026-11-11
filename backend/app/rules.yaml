@@ -1,0 +1,67 @@
+# Business rules & tolerances. Every processing run stores a snapshot of the
+# effective rules, so a decision can always be traced to the rules it used.
+# Values here are defaults; overrides saved via the Settings page are layered on top.
+
+tolerances:
+  quantity_pct: 0            # invoiced qty may not exceed remaining PO qty
+  unit_price_pct: 5          # unit price may be up to 5% above PO price
+  total_amount_pct: 5        # cumulative invoiced value vs PO value
+  rounding_abs: 0.05         # qty x price vs line total
+  tax_abs_per_line: 0.50     # rounding allowance for tax, per line
+  tax_abs_header: 1.00       # rounding allowance for tax, header level
+  subtotal_abs: 1.00         # sum(lines) vs subtotal
+  grand_total_abs: 1.00      # subtotal - discount + tax + shipping vs grand total
+
+extraction:
+  min_confidence: 0.80       # below this a field is UNCERTAIN
+  critical_fields: [vendor_identity, invoice_number, invoice_date, grand_total]
+
+dates:
+  max_future_days: 0         # invoice dated in the future -> review
+  max_age_days: 365          # older than this -> review
+  max_days_after_po: 365     # invoice this long after PO date gets no date-fit credit
+
+policy:
+  unapproved_vendor: MANUAL_REVIEW   # BLOCKED / PENDING vendors: MANUAL_REVIEW (flagged) or REJECT
+  unknown_vendor: MANUAL_REVIEW
+  currency_mismatch: MANUAL_REVIEW
+  cancelled_po: REJECT
+  closed_po_no_balance: REJECT
+  closed_po_with_balance: MANUAL_REVIEW
+  qty_exceeds_remaining: REJECT
+  price_over_tolerance: MANUAL_REVIEW
+  total_over_tolerance: MANUAL_REVIEW
+  allow_under_billing: true          # lower price / partial qty is not a violation
+
+matching:
+  select_min_score: 70       # top candidate must score at least this
+  select_margin: 15          # ...and lead the runner-up by this many points
+  line_min_similarity: 0.60  # line pairs below this are "unmatched"
+  min_description_evidence: 0.50  # selected PO needs description/code evidence >= 50% of its weight
+  require_semantic_for_auto_select: true  # without the AI meaning signal, inferred matches go to review
+  fuzzy_po_max_edits: 1      # "PO-2O01" -> "PO-2001" (OCR) is accepted with a warning
+  weights:
+    semantic: 30             # AI: meaning of descriptions
+    lexical: 10              # code: wording similarity (rapidfuzz)
+    item_code: 15
+    qty_price: 20
+    amount: 15
+    date: 10
+
+duplicates:
+  probable_threshold: 0.75
+  invoice_no_max_edits: 2
+  amount_abs: 1.00
+  date_window_days: 3
+  weights:
+    invoice_number: 0.30
+    date: 0.15
+    amount: 0.20
+    po_reference: 0.10
+    line_items: 0.15
+    fingerprint: 0.10
+
+company:
+  # Our own tax IDs (the buyer). Never mistaken for the vendor's tax ID.
+  tax_ids: ["27AABCM1234F1ZX"]
+  name: "Acme Manufacturing Pvt Ltd"
