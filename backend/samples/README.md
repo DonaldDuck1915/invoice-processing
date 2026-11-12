@@ -24,6 +24,7 @@ Upload in numeric order (some scenarios depend on earlier ones).
 | 18_review_currency_mismatch.pdf | MANUAL_REVIEW | USD invoice against an INR PO. |
 | 19_review_missing_number_math_error.pdf | MANUAL_REVIEW | No invoice number; line 2 total (652.50) != 100 x 6.25. |
 | 20_review_low_quality_scan.pdf | MANUAL_REVIEW | Barely legible scan - low OCR confidence. |
+| 23_ec5_tax_inclusive_prices.pdf | APPROVED | Prices include 18% GST (2,950 per stand vs PO 2,500 net). Net values are derived before matching, so it is not mistaken for an 18% price variance. |
 | 21_error_corrupt.pdf | Error | Truncated / corrupt PDF |
 | 22_error_not_a_pdf.pdf | Error | Not a PDF at all |
 

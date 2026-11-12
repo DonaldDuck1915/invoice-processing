@@ -11,6 +11,7 @@ from decimal import Decimal
 from .extraction.parsers import classify_tax_id, gstin_is_valid
 from .money import D, SUPPORTED_CURRENCIES, ZERO, q2, s
 from .schemas import CheckResult, ExtractedInvoice
+from .tax_mode import included_tax
 
 CRITICAL_LABELS = {"vendor_identity": "Vendor identification (tax ID or name)", "invoice_number": "Invoice number",
                    "invoice_date": "Invoice date", "grand_total": "Grand total"}
@@ -126,6 +127,11 @@ def check_tax(inv: ExtractedInvoice, rules: dict) -> list[CheckResult]:
                                severity="REVIEW", message="Both IGST and CGST are charged - only one regime applies."))
     rates = [D(li.tax_rate) for li in inv.line_items]
     totals = [D(li.line_total) for li in inv.line_items]
+    if inv.meta.get("tax_inclusive"):
+        out.append(CheckResult(code="V3.tax_mode", name="Tax presentation", status="PASS",
+                               message=f"Prices include tax ({inv.meta.get('tax_inclusive_evidence')!r}); "
+                                       "the tax is contained in the line totals, not added on top."))
+        return out + [_check_included_tax(inv, stated, rules)]
     if stated is None:
         out.append(CheckResult(code="V3.tax", name="Tax calculation", status="SKIPPED", category="MISSING",
                                severity="INFO", message="No tax amount printed - tax check skipped."))
@@ -158,11 +164,33 @@ def check_tax(inv: ExtractedInvoice, rules: dict) -> list[CheckResult]:
     return out
 
 
+def _check_included_tax(inv: ExtractedInvoice, stated: Decimal | None, rules: dict) -> CheckResult:
+    expected = included_tax(inv)
+    if expected is None:
+        return CheckResult(code="V3.tax", name="Tax calculation", status="SKIPPED", category="MISSING", severity="INFO",
+                           message="Tax-inclusive invoice without a tax rate per line - included tax cannot be recomputed.")
+    if stated is None:
+        return CheckResult(code="V3.tax", name="Tax calculation", status="PASS", expected=s(expected),
+                           message=f"No tax amount printed; the line totals contain {expected} tax at the printed rates.")
+    t = rules["tolerances"]
+    allowed = D(t["tax_abs_header"]) + D(t["tax_abs_per_line"]) * len(inv.line_items)
+    diff = abs(expected - stated)
+    ok = diff <= allowed
+    return CheckResult(code="V3.tax", name="Tax calculation", status="PASS" if ok else "FAIL",
+                       category="OK" if ok else "INCORRECT", severity="INFO" if ok else "REVIEW",
+                       expected=s(expected), actual=s(stated), details={"allowed": s(allowed), "tax_inclusive": True},
+                       message=(f"Included tax {stated} agrees with gross - gross/(1+rate) = {expected}." if ok else
+                                f"Included tax stated as {stated} but the gross line totals contain {expected} "
+                                f"(difference {q2(diff)}, rounding allowance {allowed})."))
+
+
 def check_grand_total(inv: ExtractedInvoice, rules: dict) -> CheckResult:
     tol = D(rules["tolerances"]["grand_total_abs"])
     grand = _money(inv, "grand_total")
     subtotal, discount = _tax_base(inv)
-    tax = _money(inv, "tax_amount") or ZERO
+    inclusive = bool(inv.meta.get("tax_inclusive"))
+    # with tax-inclusive prices the tax is already inside the subtotal - it is not added again
+    tax = ZERO if inclusive else (_money(inv, "tax_amount") or ZERO)
     shipping = _money(inv, "shipping") or ZERO
     if grand is None or subtotal is None:
         return CheckResult(code="V5.grand_total", name="Grand total arithmetic", status="SKIPPED", category="MISSING",
@@ -170,7 +198,8 @@ def check_grand_total(inv: ExtractedInvoice, rules: dict) -> CheckResult:
     expected = q2(subtotal - discount + tax + shipping)
     diff = abs(expected - grand)
     ok = diff <= tol
-    formula = f"{subtotal} - {discount} discount + {tax} tax + {shipping} shipping = {expected}"
+    formula = (f"{subtotal} (tax included) - {discount} discount + {shipping} shipping = {expected}" if inclusive else
+               f"{subtotal} - {discount} discount + {tax} tax + {shipping} shipping = {expected}")
     return CheckResult(code="V5.grand_total", name="Grand total arithmetic", status="PASS" if ok else "FAIL",
                        category="OK" if ok else "INCORRECT", severity="INFO" if ok else "REVIEW",
                        expected=s(expected), actual=s(grand),

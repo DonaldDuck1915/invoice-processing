@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { Download, FileSpreadsheet, Mail } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { Card, ErrorBox, Note, Spinner } from "../components/ui";
 
@@ -42,9 +43,12 @@ export default function Settings() {
   const [error, setError] = useState<unknown>(null);
   const [json, setJson] = useState(EXAMPLE);
   const [replace, setReplace] = useState(false);
+  const [csv, setCsv] = useState<File | null>(null);
+  const [email, setEmail] = useState<any>(null);
+  const csvInput = useRef<HTMLInputElement>(null);
 
   const load = () => api.get("/config/rules").then((r) => { setRules(r); setDraft(structuredClone(r.effective)); }).catch(setError);
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); api.get("/admin/email").then(setEmail).catch(() => setEmail({ enabled: false })); }, []);
   if (!draft) return error ? <ErrorBox error={error} /> : <Spinner label="Loading rules..." />;
 
   function diff(base: any, cur: any): any {
@@ -65,6 +69,27 @@ export default function Settings() {
     setError(null); setMsg(null);
     try { const body = JSON.parse(json); const r = await api.post("/admin/import", { ...body, replace }); setMsg(`Imported ${r.vendors_added} vendor(s) and ${r.purchase_orders_added} PO(s).`); }
     catch (e) { setError(e instanceof SyntaxError ? new Error("Invalid JSON: " + e.message) : e); }
+  }
+  async function importCsv() {
+    if (!csv) return;
+    setError(null); setMsg(null);
+    try {
+      const r = await api.upload(`/admin/import-csv?replace=${replace}`, csv, csv.name);
+      setMsg(`Read ${r.rows_read} row(s) / ${r.pos_in_file} PO(s): imported ${r.purchase_orders_added} PO(s) and ${r.vendors_added} new vendor(s).`);
+      setCsv(null); if (csvInput.current) csvInput.current.value = "";
+    } catch (e) { setError(e); }
+  }
+  async function downloadTemplate() {
+    const blob = await api.blob("/admin/import-csv/template");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "purchase-orders-template.csv";
+    a.click();
+  }
+  async function pollInbox() {
+    setError(null); setMsg(null);
+    try { const r = await api.post("/admin/email/poll"); setMsg(`Inbox checked: ${r.messages} new message(s), ${r.invoice_ids.length} invoice(s) queued.${r.errors.length ? " Skipped: " + r.errors.join("; ") : ""}`); setEmail(await api.get("/admin/email")); }
+    catch (e) { setError(e); }
   }
   async function resetDemo() {
     if (!confirm("Delete ALL invoices, POs and vendors and reload the demo dataset?")) return;
@@ -102,7 +127,31 @@ export default function Settings() {
         <p className="mt-4 text-xs text-slate-500">Company (buyer) tax IDs excluded from vendor detection: {draft.company.tax_ids.join(", ")}</p>
       </Card>
 
-      <Card title="Import your vendors & purchase orders" subtitle="Paste JSON in the shape below. Existing codes / PO numbers are skipped.">
+      <Card title="Import purchase orders from a spreadsheet" subtitle="CSV with one row per PO line (Excel / Google Sheets: save or download as CSV). Existing PO numbers are skipped."
+        actions={<button className="btn-secondary" onClick={downloadTemplate}><Download className="h-4 w-4" />Template</button>}>
+        <div className="flex flex-wrap items-center gap-4">
+          <input ref={csvInput} type="file" accept=".csv,text/csv" className="text-sm" onChange={(e) => setCsv(e.target.files?.[0] ?? null)} />
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />Replace all existing data</label>
+          <button className="btn-primary" disabled={!csv} onClick={importCsv}><FileSpreadsheet className="h-4 w-4" />Import CSV</button>
+        </div>
+        <p className="mt-3 text-xs text-slate-500">Columns: po_number, vendor_code, po_date, description, quantity, unit_price (required) · vendor_name, vendor_tax_id, vendor_status, currency, po_status, item_code, uom, tax_rate (optional). Common headers like "PO No", "Qty", "GST %" are recognised.</p>
+      </Card>
+
+      <Card title="E-mail intake" subtitle="Invoices sent to the AP mailbox are picked up automatically (PDF attachments).">
+        {!email ? <Spinner label="Checking..." /> : email.enabled ? (
+          <div className="flex flex-wrap items-center justify-between gap-4 text-sm">
+            <div className="space-y-0.5 text-slate-600">
+              <div>Mailbox <b className="text-slate-800">{email.mailbox}</b> · folder {email.folder} · every {email.poll_seconds}s</div>
+              <div className="text-xs">Last check: {email.last_poll ? new Date(email.last_poll).toLocaleString() : "not yet"} · {email.invoices_created} invoice(s) received{email.last_error && <span className="text-rose-600"> · last error: {email.last_error}</span>}</div>
+            </div>
+            <button className="btn-secondary" onClick={pollInbox}><Mail className="h-4 w-4" />Check inbox now</button>
+          </div>
+        ) : (
+          <p className="text-sm text-slate-600">Not configured. Set <code className="text-xs">IMAP_HOST</code>, <code className="text-xs">IMAP_USER</code> and <code className="text-xs">IMAP_PASSWORD</code> (an app password) on the API to enable it.</p>
+        )}
+      </Card>
+
+      <Card title="Import your vendors & purchase orders (JSON)" subtitle="Paste JSON in the shape below. Existing codes / PO numbers are skipped.">
         <textarea className="input font-mono text-xs h-64" value={json} onChange={(e) => setJson(e.target.value)} />
         <div className="mt-3 flex items-center gap-4">
           <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />Replace all existing data (deletes invoices too)</label>

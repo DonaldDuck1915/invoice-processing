@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from ..money import D, detect_currency, parse_amount, s
 from ..schemas import ExtractedInvoice, FieldValue, LineItem, TaxComponent
+from ..tax_mode import detect_tax_inclusive
 from .parsers import (EU_VAT_RE, GSTIN_LABELLED_RE, GSTIN_LOOSE_RE, GSTIN_RE, US_EIN_RE, classify_tax_id,
                       gstin_is_valid, parse_date, repair_gstin)
 from .pdf_reader import DocumentText, Line, Word
@@ -384,9 +385,11 @@ def extract_with_rules(doc: DocumentText, company_tax_ids: list[str] | None = No
     else:
         f["tax_amount"] = _missing()
 
+    incl = detect_tax_inclusive(full)
     inv.meta = {
         "extractor": "rules", "is_scanned": doc.is_scanned, "pages": doc.page_count,
         "ocr_mean_conf": round(doc.ocr_mean_conf, 3) if doc.ocr_mean_conf is not None else None,
         "date_order": prefer, "table_header_found": header_idx is not None,
+        "tax_inclusive": incl is not None, "tax_inclusive_evidence": incl,
     }
     return inv

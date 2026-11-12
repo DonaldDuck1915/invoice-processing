@@ -157,8 +157,9 @@ def _ocr_page(page: fitz.Page, number: int, tesseract_cmd: str | None = None) ->
     import pytesseract
     from PIL import Image
 
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    cmd = resolve_tesseract(tesseract_cmd)
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
     zoom = 300 / 72
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -207,12 +208,31 @@ def _deskew(arr, cv2):
     return cv2.warpAffine(arr, m, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
+_WINDOWS_TESSERACT = [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                      r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
+
+
+def resolve_tesseract(tesseract_cmd: str | None = None) -> str | None:
+    """Explicit setting > tesseract on PATH > the default Windows install locations."""
+    import os
+    import shutil
+
+    if tesseract_cmd:
+        return tesseract_cmd
+    if shutil.which("tesseract"):
+        return None  # pytesseract finds it on PATH by itself
+    local = os.environ.get("LOCALAPPDATA")
+    candidates = _WINDOWS_TESSERACT + ([os.path.join(local, "Programs", "Tesseract-OCR", "tesseract.exe")] if local else [])
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
 def ocr_available(tesseract_cmd: str | None = None) -> bool:
     try:
         import pytesseract
 
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        cmd = resolve_tesseract(tesseract_cmd)
+        if cmd:
+            pytesseract.pytesseract.tesseract_cmd = cmd
         pytesseract.get_tesseract_version()
         return True
     except Exception:  # noqa: BLE001

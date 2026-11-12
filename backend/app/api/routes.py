@@ -2,25 +2,32 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+import threading
+import time
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models as m
-from ..config import get_settings, load_default_rules
-from ..db import SessionLocal, get_db
+from ..config import deep_merge, get_settings, load_default_rules
+from .. import email_intake
+from ..csv_import import TEMPLATE as CSV_TEMPLATE
+from ..csv_import import parse_procurement_csv
+from ..db import get_db
+from ..extraction.parsers import normalize_ref
 from ..extraction.pdf_reader import DocumentError, ocr_available
 from ..ingestion import ingest
+from ..jobs import process_many
 from ..ledger import consumption_by_line, po_snapshot
 from ..llm import AI_DISCLAIMER
-from ..pipeline import (confirm_po, correct_fields, effective_rules, final_decision, latest_run, process_invoice,
+from ..pipeline import (POBalanceExceeded, confirm_po, correct_fields, effective_rules, final_decision, latest_run,
                         resolve_duplicate)
 from ..seed import import_procurement, seed_demo
 from .auth import check_credentials, current_user, issue_token
@@ -34,6 +41,9 @@ def jsonable(obj: Any) -> Any:
     """Decimals are serialised as strings so no precision is lost to floats."""
     if isinstance(obj, Decimal):
         return format(obj, "f")
+    if isinstance(obj, datetime) and obj.tzinfo is None:
+        # timestamps are stored in UTC; SQLite drops the zone, so restore it or browsers read local time
+        return obj.replace(tzinfo=timezone.utc).isoformat()
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     if isinstance(obj, dict):
@@ -58,10 +68,33 @@ class LoginBody(BaseModel):
     password: str
 
 
+_failed_logins: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _throttle(client: str) -> None:
+    """Simple per-client brute-force guard: N failures inside the window lock that client out until
+    the oldest failure ages out."""
+    s = get_settings()
+    now = time.monotonic()
+    with _login_lock:
+        recent = [t for t in _failed_logins.get(client, []) if now - t < s.login_window_seconds]
+        _failed_logins[client] = recent
+        if len(recent) >= s.login_max_attempts:
+            wait = int(s.login_window_seconds - (now - recent[0])) + 1
+            err(429, "TOO_MANY_ATTEMPTS", f"Too many failed sign-ins. Try again in {wait} seconds.")
+
+
 @router.post("/auth/login")
-def login(body: LoginBody):
+def login(body: LoginBody, request: Request):
+    client = request.client.host if request.client else "unknown"
+    _throttle(client)
     if not check_credentials(body.username, body.password):
+        with _login_lock:
+            _failed_logins.setdefault(client, []).append(time.monotonic())
         err(401, "INVALID_CREDENTIALS", "Incorrect username or password.")
+    with _login_lock:
+        _failed_logins.pop(client, None)
     s = get_settings()
     return {"token": issue_token(body.username), "user": {"username": body.username, "name": s.reviewer_display_name}}
 
@@ -76,20 +109,21 @@ def health(db: Session = Depends(get_db)):
     s = get_settings()
     db.execute(select(1))
     return {"ok": True, "ocr_available": ocr_available(s.tesseract_cmd), "ai_configured": s.llm_available,
-            "ai_model": s.llm_model if s.llm_available else None,
-            "database": "postgresql" if s.database_url.startswith("postgresql") else "sqlite"}
+            "ai_model": s.ai_model, "ai_provider": s.ai_provider,
+            "ai_fast_model": (s.gemini_fast_model or s.gemini_model) if s.ai_provider == "gemini" else s.ai_model,
+            "database": "postgresql" if s.database_url.startswith("postgresql") else "sqlite",
+            "email_intake": bool(s.imap_host), "insecure_defaults": s.insecure_defaults}
 
 
 # ============================================================================ invoices
 
-def _run_in_background(invoice_id: int, trigger: str = "INITIAL", actor: str = "SYSTEM"):
-    db = SessionLocal()
-    try:
-        process_invoice(db, invoice_id, trigger, actor)
-    except Exception:  # noqa: BLE001
-        log.exception("background processing failed")
-    finally:
-        db.close()
+async def _read_upload(file: UploadFile) -> bytes:
+    """Read at most the size limit (+1 byte) so an oversized upload is refused without buffering all of it."""
+    limit = get_settings().max_upload_mb * 1024 * 1024
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        err(413, "FILE_TOO_LARGE", f"{file.filename}: the file exceeds the {get_settings().max_upload_mb} MB limit.")
+    return data
 
 
 def _invoice_summary(inv: m.Invoice) -> dict:
@@ -105,13 +139,39 @@ def _invoice_summary(inv: m.Invoice) -> dict:
 @router.post("/invoices", status_code=202)
 async def upload_invoice(background: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db),
                          user: str = Depends(current_user)):
-    data = await file.read()
+    data = await _read_upload(file)
     try:
         inv = ingest(db, data, file.filename, file.content_type, user)
     except DocumentError as e:
         err(400, e.code, e.message)
-    background.add_task(_run_in_background, inv.id, "INITIAL", user)
+    background.add_task(process_many, [inv.id], "INITIAL", user)
     return ok(_invoice_summary(inv), 202)
+
+
+MAX_BATCH = 25
+
+
+@router.post("/invoices/batch", status_code=202)
+async def upload_batch(background: BackgroundTasks, files: list[UploadFile] = File(...),
+                       db: Session = Depends(get_db), user: str = Depends(current_user)):
+    """Several PDFs at once. Each file is validated on its own; accepted ones are processed one after
+    another (in upload order, so split invoices and duplicates are evaluated in sequence)."""
+    if len(files) > MAX_BATCH:
+        err(400, "TOO_MANY_FILES", f"Upload at most {MAX_BATCH} files at a time.")
+    accepted, rejected = [], []
+    for f in files:
+        try:
+            data = await _read_upload(f)
+            inv = ingest(db, data, f.filename, f.content_type, user)
+            accepted.append(_invoice_summary(inv))
+        except DocumentError as e:
+            db.rollback()
+            rejected.append({"filename": f.filename, "error_code": e.code, "message": e.message})
+        except HTTPException as e:
+            rejected.append({"filename": f.filename, **(e.detail if isinstance(e.detail, dict) else {})})
+    if accepted:
+        background.add_task(process_many, [a["id"] for a in accepted], "INITIAL", user)
+    return ok({"accepted": accepted, "rejected": rejected}, 202)
 
 
 @router.get("/invoices")
@@ -189,6 +249,22 @@ def invoice_detail(invoice_id: int, db: Session = Depends(get_db), user: str = D
                "duplicate_resolution": inv.duplicate_resolution, "ai_disclaimer": AI_DISCLAIMER})
 
 
+@router.get("/invoices/{invoice_id}/progress")
+def invoice_progress(invoice_id: int, db: Session = Depends(get_db), user: str = Depends(current_user)):
+    """Small payload for the live run view: current stage plus every audit event of the current run
+    (each stage commits as it finishes, so this fills in while the pipeline is running)."""
+    inv = _get_invoice(db, invoice_id)
+    run = latest_run(db, inv.id)
+    stmt = select(m.AuditEvent).where(m.AuditEvent.invoice_id == invoice_id).order_by(m.AuditEvent.seq)
+    if run:
+        stmt = stmt.where((m.AuditEvent.run_no == run.run_no) | (m.AuditEvent.run_no.is_(None)))
+    events = db.scalars(stmt).all()
+    return ok({"invoice": _invoice_summary(inv), "run_no": run.run_no if run else None,
+               "started_at": run.started_at if run else None, "finished_at": run.finished_at if run else None,
+               "events": [{"seq": e.seq, "event_type": e.event_type, "message": e.message, "actor": e.actor,
+                           "created_at": e.created_at} for e in events]})
+
+
 @router.get("/invoices/{invoice_id}/file")
 def invoice_file(invoice_id: int, db: Session = Depends(get_db), user: str = Depends(current_user)):
     inv = _get_invoice(db, invoice_id)
@@ -238,11 +314,19 @@ class ReprocessBody(BaseModel):
     re_extract: bool = False
 
 
-@router.post("/invoices/{invoice_id}/reprocess")
-def reprocess(invoice_id: int, body: ReprocessBody, db: Session = Depends(get_db), user: str = Depends(current_user)):
+@router.post("/invoices/{invoice_id}/reprocess", status_code=202)
+def reprocess(invoice_id: int, body: ReprocessBody, background: BackgroundTasks, db: Session = Depends(get_db),
+              user: str = Depends(current_user)):
+    """Runs in the background so the live run view can follow it; poll /progress or the detail."""
     inv = _get_invoice(db, invoice_id)
-    process_invoice(db, inv.id, "RE_EXTRACT" if body.re_extract else "REPROCESS", user)
-    return invoice_detail(invoice_id, db, user)
+    if inv.status in ("RECEIVED", "PROCESSING"):
+        err(409, "ALREADY_PROCESSING", "This invoice is already being processed.")
+    inv.status, inv.stage = "PROCESSING", "QUEUED"
+    db.commit()
+    background.add_task(process_many, [inv.id], "RE_EXTRACT" if body.re_extract else "REPROCESS", user)
+    res = invoice_detail(invoice_id, db, user)
+    res.status_code = 202
+    return res
 
 
 class FieldsBody(BaseModel):
@@ -277,6 +361,11 @@ def confirm_po_route(invoice_id: int, body: ConfirmPOBody, db: Session = Depends
         err(404, "PO_NOT_FOUND", f"PO {body.po_number} not found.")
     if inv.vendor_id and po.vendor_id != inv.vendor_id:
         err(422, "PO_VENDOR_MISMATCH", f"{po.po_number} belongs to a different vendor.")
+    if not inv.vendor_id and inv.vendor_tax_id and po.vendor.tax_id \
+            and normalize_ref(inv.vendor_tax_id) != normalize_ref(po.vendor.tax_id):
+        # vendor not in the master data: the printed tax ID must still agree with the PO's vendor
+        err(422, "PO_VENDOR_MISMATCH", f"{po.po_number} belongs to {po.vendor.name} (tax ID {po.vendor.tax_id}), "
+                                       f"but the invoice shows tax ID {inv.vendor_tax_id}.")
     confirm_po(db, inv, po, body.reason, user)
     return invoice_detail(invoice_id, db, user)
 
@@ -303,7 +392,11 @@ def final(invoice_id: int, body: FinalBody, db: Session = Depends(get_db), user:
     inv = _get_invoice(db, invoice_id)
     if inv.status != "PROCESSED":
         err(409, "NOT_PROCESSED", "The invoice has not finished processing.")
-    final_decision(db, inv, body.decision, body.reason, user)
+    try:
+        final_decision(db, inv, body.decision, body.reason, user)
+    except POBalanceExceeded as e:
+        db.rollback()
+        err(409, "PO_BALANCE_EXCEEDED", e.message, e.evidence)
     return invoice_detail(invoice_id, db, user)
 
 
@@ -388,23 +481,57 @@ class RulesBody(BaseModel):
     overrides: dict
 
 
+POLICY_VALUES = {"MANUAL_REVIEW", "REJECT"}
+# values that are fractions / probabilities and must stay within 0..1
+FRACTION_RULES = {"extraction.min_confidence", "duplicates.probable_threshold", "matching.line_min_similarity",
+                  "matching.min_description_evidence"}
+
+
+def validate_rule_overrides(overrides: dict, defaults: dict) -> None:
+    """Every override must name an existing rule and keep that rule's type; numbers must be in range;
+    policy outcomes must be MANUAL_REVIEW or REJECT; duplicate weights must still add up to 1."""
+    def walk(o, d, path=""):
+        if not isinstance(o, dict):
+            err(422, "INVALID_RULE", f"{path or 'overrides'} must be an object")
+        for k, v in o.items():
+            name = f"{path}{k}"
+            if k not in d:
+                err(422, "UNKNOWN_RULE", f"Unknown rule {name}")
+            ref = d[k]
+            if isinstance(ref, dict):
+                walk(v, ref, f"{name}.")
+            elif isinstance(ref, bool):
+                if not isinstance(v, bool):
+                    err(422, "INVALID_RULE", f"{name} must be true or false")
+            elif isinstance(ref, (int, float)):
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                    err(422, "INVALID_RULE", f"{name} must be a non-negative number")
+                if name in FRACTION_RULES and v > 1:
+                    err(422, "INVALID_RULE", f"{name} must be between 0 and 1")
+            elif isinstance(ref, list):
+                if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
+                    err(422, "INVALID_RULE", f"{name} must be a list of text values")
+            elif isinstance(ref, str):
+                if not isinstance(v, str) or not v.strip():
+                    err(422, "INVALID_RULE", f"{name} must be text")
+                if path == "policy." and v not in POLICY_VALUES:
+                    err(422, "INVALID_RULE", f"{name} must be one of {', '.join(sorted(POLICY_VALUES))}")
+
+    walk(overrides, defaults)
+    merged = deep_merge(defaults, overrides)
+    weights = merged["duplicates"]["weights"]
+    if abs(sum(float(x) for x in weights.values()) - 1.0) > 0.001:
+        err(422, "INVALID_RULE", f"duplicates.weights must add up to 1 (they add up to "
+                                 f"{sum(float(x) for x in weights.values()):.2f})")
+    if sum(float(x) for x in merged["matching"]["weights"].values()) <= 0:
+        err(422, "INVALID_RULE", "matching.weights cannot all be zero")
+
+
 @router.put("/config/rules")
 def put_rules(body: RulesBody, db: Session = Depends(get_db), user: str = Depends(current_user)):
     defaults = load_default_rules()
 
-    def validate(o, d, path=""):
-        for k, v in o.items():
-            if k not in d:
-                err(422, "UNKNOWN_RULE", f"Unknown rule {path}{k}")
-            if isinstance(v, dict):
-                if not isinstance(d[k], dict):
-                    err(422, "INVALID_RULE", f"{path}{k} is not a group")
-                validate(v, d[k], f"{path}{k}.")
-            elif isinstance(d[k], (int, float)) and not isinstance(d[k], bool):
-                if not isinstance(v, (int, float)) or v < 0:
-                    err(422, "INVALID_RULE", f"{path}{k} must be a non-negative number")
-
-    validate(body.overrides, defaults)
+    validate_rule_overrides(body.overrides, defaults)
     db.add(m.RuleOverride(overrides=body.overrides, updated_by=user))
     db.commit()
     return get_rules(db, user)
@@ -414,7 +541,49 @@ def put_rules(body: RulesBody, db: Session = Depends(get_db), user: str = Depend
 
 @router.post("/admin/reset-demo")
 def reset_demo(db: Session = Depends(get_db), user: str = Depends(current_user)):
+    if not get_settings().allow_demo_reset:
+        err(403, "RESET_DISABLED", "Resetting the data is disabled on this instance (ALLOW_DEMO_RESET=false).")
     return seed_demo(db, reset=True)
+
+
+@router.post("/admin/import-csv")
+async def import_csv(file: UploadFile = File(...), replace: bool = False, db: Session = Depends(get_db),
+                     user: str = Depends(current_user)):
+    data = await file.read(5 * 1024 * 1024 + 1)
+    if len(data) > 5 * 1024 * 1024:
+        err(413, "FILE_TOO_LARGE", "The CSV exceeds 5 MB.")
+    try:
+        payload = parse_procurement_csv(data)
+        result = import_procurement(db, payload, replace=replace)
+    except UnicodeDecodeError:
+        err(422, "IMPORT_FAILED", "The file is not UTF-8 text. Save it from your spreadsheet as 'CSV UTF-8'.")
+    except (KeyError, ValueError) as e:
+        db.rollback()
+        err(422, "IMPORT_FAILED", f"Import failed: {e}")
+    return {**result, "rows_read": sum(len(p["lines"]) for p in payload["purchase_orders"]),
+            "pos_in_file": len(payload["purchase_orders"])}
+
+
+@router.get("/admin/import-csv/template")
+def csv_template(user: str = Depends(current_user)):
+    return Response(CSV_TEMPLATE, media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="purchase-orders-template.csv"'})
+
+
+@router.get("/admin/email")
+def email_status(user: str = Depends(current_user)):
+    s = get_settings()
+    return {**email_intake.STATUS, "enabled": bool(s.imap_host), "mailbox": s.imap_user, "folder": s.imap_folder,
+            "poll_seconds": s.imap_poll_seconds}
+
+
+@router.post("/admin/email/poll")
+def email_poll(user: str = Depends(current_user)):
+    res = email_intake.poll_once()
+    if not res["ok"]:
+        err(409 if "configured" in res["error"] or "already" in res["error"] else 502, "EMAIL_POLL_FAILED",
+            res["error"])
+    return res
 
 
 class ImportBody(BaseModel):

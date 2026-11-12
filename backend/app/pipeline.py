@@ -8,10 +8,11 @@ re-uses the stored extraction (no new AI extraction call).
 from __future__ import annotations
 
 import logging
+import threading
 import traceback
 from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 
 from . import models as m
@@ -30,9 +31,50 @@ from .matching.vendor import resolve_vendor
 from .money import D
 from .schemas import ExtractedInvoice
 from .summary import ai_summary
+from .tax_mode import net_view
 from .validation import run_validation
 
 log_ = logging.getLogger(__name__)
+
+# Matching -> duplicate check -> decision -> ledger must see a consistent PO ledger and the full
+# invoice history, so that section runs for one invoice at a time. Extraction (the slow part,
+# OCR / AI) still runs in parallel.
+_LEDGER_LOCK = threading.RLock()
+_PG_LOCK_KEY = 74_240_001
+
+
+class LedgerSection:
+    """Process-wide lock, plus a Postgres advisory lock so several API workers also serialise."""
+
+    def __init__(self, db: Session):
+        self.db = db
+        self.pg = db.get_bind().dialect.name == "postgresql"
+
+    def __enter__(self):
+        _LEDGER_LOCK.acquire()
+        if self.pg:
+            self.db.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _PG_LOCK_KEY})
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.pg:
+                self.db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _PG_LOCK_KEY})
+                self.db.commit()
+        finally:
+            _LEDGER_LOCK.release()
+
+
+class POBalanceExceeded(Exception):
+    def __init__(self, message: str, evidence: list[dict]):
+        super().__init__(message)
+        self.message, self.evidence = message, evidence
+
+
+def _stage(db: Session, invoice: m.Invoice, stage: str) -> None:
+    """Commit progress so the live run view (another request) sees each stage as it starts."""
+    invoice.stage = stage
+    db.commit()
 
 
 def effective_rules(db: Session) -> dict:
@@ -124,8 +166,15 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
                 f"Applied reviewer corrections to {len((invoice.corrections or {}).get('fields', {}))} field(s)"
                 + (" and line items" if invoice.corrections.get("line_items") is not None else "") + ".",
                 invoice.corrections, rn)
+        for w in base.meta.get("warnings") or []:
+            if "OCR" in w:
+                stage_errors.append(w + " Install Tesseract (see README) or correct the fields manually.")
+        if inv.meta.get("tax_inclusive"):
+            log(db, invoice.id, "TAX_INCLUSIVE_DETECTED",
+                f"Prices include tax ({inv.meta.get('tax_inclusive_evidence')!r}); net amounts are derived from the "
+                "line tax rates for PO matching.", {"evidence": inv.meta.get("tax_inclusive_evidence")}, rn)
         run.extraction = {"base": base.model_dump(), "result": inv.model_dump()}
-        invoice.stage = "VALIDATING"
+        _stage(db, invoice, "VALIDATING")
 
         # ------------------------------------------------------------------ vendor + validation
         vendors = [_vendor_dict(v) for v in db.scalars(select(m.Vendor))]
@@ -138,99 +187,9 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
             f"{sum(c.status in ('WARN', 'SKIPPED') for c in checks)} warnings/skipped."
             + (f" Vendor: {vres['vendor']['name']} via {vres['method']}." if vres["vendor"] else " Vendor not identified."),
             {"failed": [c.code for c in fails]}, rn)
-        invoice.stage = "MATCHING"
-
-        # ------------------------------------------------------------------ PO matching
-        consumed = consumption_by_line(db, exclude_invoice_id=invoice.id)
-        pos = db.scalars(select(m.PurchaseOrder).options(selectinload(m.PurchaseOrder.lines),
-                                                         selectinload(m.PurchaseOrder.vendor))).all()
-        snaps = {p.po_number: po_snapshot(p, consumed) for p in pos}
-        vendor = vres["vendor"]
-        vendor_pos = [sn for sn in snaps.values() if vendor and sn["vendor_id"] == vendor["id"]]
-        confirmed = None
-        if invoice.confirmed_po_id:
-            cp = db.get(m.PurchaseOrder, invoice.confirmed_po_id)
-            confirmed = snaps.get(cp.po_number) if cp else None
-        scorer = SemanticScorer(llm)
-        match = match_po(inv, vendor, vendor_pos, snaps, rules, scorer, confirmed)
-        run.matching = match
-        if match.get("method") == "INFERRED" or match.get("candidates"):
-            log(db, invoice.id, "PO_CANDIDATES_RANKED",
-                f"Ranked {len(match['candidates'])} candidate PO(s): " +
-                ", ".join(f"{c['po_number']}={c['score'] if c['score'] is not None else 'ineligible'}"
-                          for c in match["candidates"][:4]) +
-                (f". AI meaning signal: {'available' if match['semantic']['available'] else 'unavailable'}."),
-                {"candidates": [{"po": c["po_number"], "score": c["score"]} for c in match["candidates"]]}, rn)
-        log(db, invoice.id, "PO_IDENTIFIED" if match["selected_po"] else "PO_NOT_IDENTIFIED",
-            match["explanation"] or (f"Selected {match['selected_po']}" if match["selected_po"] else "No PO selected."),
-            {"method": match["method"], "selected_po": match["selected_po"], "ambiguous": match["ambiguous"]}, rn)
-        exceeded = [v for v in match["variances"] if v["exceeded"]]
-        log(db, invoice.id, "MATCHING_COMPLETED",
-            f"{len(match['pairs'])} line(s) matched, {len(match['unmatched_lines'])} unmatched; "
-            f"{len(match['variances'])} variance(s) computed, {len(exceeded)} outside tolerance.",
-            {"issues": [i["code"] for i in match["issues"]]}, rn)
-        invoice.stage = "DUPLICATE_CHECK"
-
-        # ------------------------------------------------------------------ duplicates
-        dup = check_duplicates(inv, invoice.file_sha256, vendor["id"] if vendor else None, _history(db, invoice), rules)
-        run.duplicates = dup
-        log(db, invoice.id, "DUPLICATE_CHECK_COMPLETED", dup["explanation"],
-            {"status": dup["status"], "fingerprint": dup.get("fingerprint")}, rn)
-        invoice.stage = "DECIDING"
-
-        # ------------------------------------------------------------------ decision
-        decision = decide(inv, checks, vres, match, dup, rules, invoice.duplicate_resolution, stage_errors)
-        run.decision = decision.model_dump()
-        log(db, invoice.id, "DECISION_GENERATED", f"{decision.decision}: {decision.summary}",
-            {"decision": decision.decision, "rules": [r.rule for r in decision.reasons]}, rn)
-
-        # ------------------------------------------------------------------ denormalised header
-        invoice.vendor_id = vendor["id"] if vendor else None
-        invoice.po_id = match["selected_po_id"]
-        invoice.vendor_tax_id = inv.get("vendor_tax_id")
-        name_field = inv.field("vendor_name")
-        invoice.vendor_name = vendor["name"] if vendor else (
-            name_field.value if name_field.status in ("EXTRACTED", "CORRECTED") else None)
-        invoice.invoice_number = inv.get("invoice_number")
-        invoice.invoice_number_norm = normalize_ref(inv.get("invoice_number")) or None
-        invoice.invoice_date = date.fromisoformat(inv.get("invoice_date")) if inv.get("invoice_date") else None
-        invoice.currency = inv.get("currency") or (snaps[match["selected_po"]]["currency"] if match["selected_po"] else None)
-        invoice.grand_total = D(inv.get("grand_total"))
-        invoice.po_reference = match["selected_po"] or inv.get("po_number")
-        invoice.content_fingerprint = fingerprint(inv)
-        invoice.system_decision = decision.decision
-        invoice.decision, invoice.decided_by = decision.decision, "SYSTEM"
-
-        # ------------------------------------------------------------------ ledger
-        if decision.decision == "APPROVED" and match["selected_po_id"]:
-            po = db.get(m.PurchaseOrder, match["selected_po_id"])
-            recorded = record_consumption(db, invoice.id, po, match["pairs"])
-            log(db, invoice.id, "PO_CONSUMPTION_RECORDED",
-                f"Recorded consumption on {po.po_number}: " +
-                ", ".join(f"line {r['po_line_no']} qty {r['quantity']}" for r in recorded) + ".", {"lines": recorded}, rn)
-        else:
-            n = reverse_consumption(db, invoice.id)
-            if n:
-                log(db, invoice.id, "PO_CONSUMPTION_REVERSED",
-                    f"Reversed {n} consumption row(s) from an earlier approval.", {}, rn)
-
-        # ------------------------------------------------------------------ AI summary
-        facts = {"decision": decision.decision, "deterministic_summary": decision.summary,
-                 "reasons": [r.message for r in decision.reasons], "next_action": decision.next_action,
-                 "vendor": invoice.vendor_name, "invoice_number": invoice.invoice_number,
-                 "grand_total": str(invoice.grand_total) if invoice.grand_total is not None else None,
-                 "currency": invoice.currency, "po": match["selected_po"], "po_method": match["method"],
-                 "po_explanation": match["explanation"], "duplicates": dup["explanation"],
-                 "variances_outside_tolerance": [{k: v[k] for k in ("label", "field", "expected", "actual", "pct_diff",
-                                                                    "tolerance")} for v in exceeded]}
-        run.ai_summary = ai_summary(llm, facts)
-        if run.ai_summary and run.ai_summary.get("text"):
-            log(db, invoice.id, "AI_SUMMARY_GENERATED", "AI summary generated (labelled as AI output).", {}, rn)
-        run.llm_calls = llm.calls
-        run.finished_at = datetime.now(timezone.utc)
-        invoice.status, invoice.stage = "PROCESSED", "DONE"
-        db.commit()
-        return run
+        _stage(db, invoice, "MATCHING")
+        with LedgerSection(db):
+            return _match_decide_record(db, invoice, run, inv, vres, checks, rules, llm, stage_errors, rn)
     except DocumentError as e:
         db.rollback()
         invoice = db.get(m.Invoice, invoice_id)
@@ -246,6 +205,130 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
         log(db, invoice.id, "PROCESSING_FAILED", f"Unexpected error: {e}", {"trace": traceback.format_exc()[-2000:]}, rn)
         db.commit()
         return run
+
+
+def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, inv: ExtractedInvoice, vres: dict,
+                         checks: list, rules: dict, llm: LLMClient, stage_errors: list[str], rn: int) -> m.ProcessingRun:
+    """PO matching -> duplicate check -> decision -> ledger -> AI summary. Runs inside LedgerSection,
+    so the PO balances and the invoice history it reads cannot change underneath it."""
+    # ---------------------------------------------------------------------- PO matching
+    # Tax-inclusive invoices are matched on net (ex-tax) values, the basis PO prices use.
+    inv_match = net_view(inv)
+    consumed = consumption_by_line(db, exclude_invoice_id=invoice.id)
+    pos = db.scalars(select(m.PurchaseOrder).options(selectinload(m.PurchaseOrder.lines),
+                                                     selectinload(m.PurchaseOrder.vendor))).all()
+    snaps = {p.po_number: po_snapshot(p, consumed) for p in pos}
+    vendor = vres["vendor"]
+    vendor_pos = [sn for sn in snaps.values() if vendor and sn["vendor_id"] == vendor["id"]]
+    confirmed = None
+    if invoice.confirmed_po_id:
+        cp = db.get(m.PurchaseOrder, invoice.confirmed_po_id)
+        confirmed = snaps.get(cp.po_number) if cp else None
+    match = match_po(inv_match, vendor, vendor_pos, snaps, rules, SemanticScorer(llm), confirmed)
+    if inv_match is not inv:
+        match["net_basis"] = inv_match.meta.get("net_conversion")
+    run.matching = match
+    if match.get("method") == "INFERRED" or match.get("candidates"):
+        log(db, invoice.id, "PO_CANDIDATES_RANKED",
+            f"Ranked {len(match['candidates'])} candidate PO(s): " +
+            ", ".join(f"{c['po_number']}={c['score'] if c['score'] is not None else 'ineligible'}"
+                      for c in match["candidates"][:4]) +
+            (f". AI meaning signal: {'available' if match['semantic']['available'] else 'unavailable'}."),
+            {"candidates": [{"po": c["po_number"], "score": c["score"]} for c in match["candidates"]]}, rn)
+    log(db, invoice.id, "PO_IDENTIFIED" if match["selected_po"] else "PO_NOT_IDENTIFIED",
+        match["explanation"] or (f"Selected {match['selected_po']}" if match["selected_po"] else "No PO selected."),
+        {"method": match["method"], "selected_po": match["selected_po"], "ambiguous": match["ambiguous"]}, rn)
+    exceeded = [v for v in match["variances"] if v["exceeded"]]
+    log(db, invoice.id, "MATCHING_COMPLETED",
+        f"{len(match['pairs'])} line(s) matched, {len(match['unmatched_lines'])} unmatched; "
+        f"{len(match['variances'])} variance(s) computed, {len(exceeded)} outside tolerance.",
+        {"issues": [i["code"] for i in match["issues"]]}, rn)
+    _stage(db, invoice, "DUPLICATE_CHECK")
+
+    # ---------------------------------------------------------------------- duplicates
+    dup = check_duplicates(inv, invoice.file_sha256, vendor["id"] if vendor else None, _history(db, invoice), rules)
+    run.duplicates = dup
+    log(db, invoice.id, "DUPLICATE_CHECK_COMPLETED", dup["explanation"],
+        {"status": dup["status"], "fingerprint": dup.get("fingerprint")}, rn)
+    _stage(db, invoice, "DECIDING")
+
+    # ---------------------------------------------------------------------- decision
+    decision = decide(inv, checks, vres, match, dup, rules, invoice.duplicate_resolution, stage_errors)
+    run.decision = decision.model_dump()
+    log(db, invoice.id, "DECISION_GENERATED", f"{decision.decision}: {decision.summary}",
+        {"decision": decision.decision, "rules": [r.rule for r in decision.reasons]}, rn)
+
+    # ---------------------------------------------------------------------- denormalised header
+    invoice.vendor_id = vendor["id"] if vendor else None
+    invoice.po_id = match["selected_po_id"]
+    invoice.vendor_tax_id = inv.get("vendor_tax_id")
+    name_field = inv.field("vendor_name")
+    invoice.vendor_name = vendor["name"] if vendor else (
+        name_field.value if name_field.status in ("EXTRACTED", "CORRECTED") else None)
+    invoice.invoice_number = inv.get("invoice_number")
+    invoice.invoice_number_norm = normalize_ref(inv.get("invoice_number")) or None
+    invoice.invoice_date = date.fromisoformat(inv.get("invoice_date")) if inv.get("invoice_date") else None
+    invoice.currency = inv.get("currency") or (snaps[match["selected_po"]]["currency"] if match["selected_po"] else None)
+    invoice.grand_total = D(inv.get("grand_total"))
+    invoice.po_reference = match["selected_po"] or inv.get("po_number")
+    invoice.content_fingerprint = fingerprint(inv)
+    invoice.system_decision = decision.decision
+
+    # A reviewer's final decision is never silently overwritten by a re-run: the system's new
+    # view is stored and logged next to it, and the reviewer can change their decision explicitly.
+    human_final = invoice.decided_by == "HUMAN" and invoice.decision in ("APPROVED", "REJECTED")
+    effective = invoice.decision if human_final else decision.decision
+    if human_final:
+        log(db, invoice.id, "HUMAN_DECISION_KEPT",
+            f"Reviewer decision {invoice.decision} kept; this run's system decision is {decision.decision}.",
+            {"human_decision": invoice.decision, "system_decision": decision.decision}, rn)
+    else:
+        invoice.decision, invoice.decided_by = decision.decision, "SYSTEM"
+
+    # ---------------------------------------------------------------------- ledger
+    if effective == "APPROVED" and match["selected_po_id"]:
+        po = db.get(m.PurchaseOrder, match["selected_po_id"])
+        recorded = record_consumption(db, invoice.id, po, match["pairs"])
+        log(db, invoice.id, "PO_CONSUMPTION_RECORDED",
+            f"Recorded consumption on {po.po_number}: " +
+            ", ".join(f"line {r['po_line_no']} qty {r['quantity']}" for r in recorded) + ".", {"lines": recorded}, rn)
+    elif effective != "APPROVED":
+        n = reverse_consumption(db, invoice.id)
+        if n:
+            log(db, invoice.id, "PO_CONSUMPTION_REVERSED",
+                f"Reversed {n} consumption row(s) from an earlier approval.", {}, rn)
+    _stage(db, invoice, "SUMMARISING")
+
+    # ---------------------------------------------------------------------- AI summary
+    facts = {"decision": decision.decision, "deterministic_summary": decision.summary,
+             "reasons": [r.message for r in decision.reasons], "next_action": decision.next_action,
+             "vendor": invoice.vendor_name, "invoice_number": invoice.invoice_number,
+             "grand_total": str(invoice.grand_total) if invoice.grand_total is not None else None,
+             "currency": invoice.currency, "po": match["selected_po"], "po_method": match["method"],
+             "po_explanation": match["explanation"], "duplicates": dup["explanation"],
+             "variances_outside_tolerance": [{k: v[k] for k in ("label", "field", "expected", "actual", "pct_diff",
+                                                                "tolerance")} for v in exceeded],
+             # context the recommendation needs (facts only - the AI never sees raw documents here)
+             "vendor_status": vendor["status"] if vendor else "NOT_IN_MASTER_DATA",
+             "failed_checks": [{"check": c.name, "message": c.message} for c in checks if c.status == "FAIL"],
+             "uncertain_or_missing_fields": sorted(n for n, f in inv.fields.items()
+                                                   if f.status in ("UNCERTAIN", "MISSING")
+                                                   and n in ("vendor_tax_id", "invoice_number", "invoice_date",
+                                                             "grand_total", "po_number", "currency")),
+             "po_candidates": [{"po_number": c["po_number"], "score": c["score"], "description": c.get("description"),
+                                "remaining_amount": c.get("remaining_amount")}
+                               for c in match.get("candidates", []) if c.get("eligible")][:5],
+             "duplicate_status": dup["status"],
+             "invoice_line_count": len(inv.line_items),
+             "tax_inclusive": bool(inv.meta.get("tax_inclusive"))}
+    run.ai_summary = ai_summary(llm, facts)
+    if run.ai_summary and run.ai_summary.get("text"):
+        log(db, invoice.id, "AI_SUMMARY_GENERATED", "AI summary generated (labelled as AI output).", {}, rn)
+    run.llm_calls = llm.calls
+    run.finished_at = datetime.now(timezone.utc)
+    invoice.status, invoice.stage = "PROCESSED", "DONE"
+    db.commit()
+    return run
 
 
 # ============================================================================ human review
@@ -289,8 +372,37 @@ def resolve_duplicate(db: Session, invoice: m.Invoice, resolution: str, reason: 
     return process_invoice(db, invoice.id, "DUPLICATE_RESOLVED", user, llm)
 
 
+def _check_po_balance(db: Session, invoice: m.Invoice, run: m.ProcessingRun, po: m.PurchaseOrder) -> None:
+    """Re-check the matched lines against the PO balance *now*. Other invoices may have been approved
+    since this one was processed, so the run's stored variances can be stale."""
+    consumed = consumption_by_line(db, exclude_invoice_id=invoice.id)
+    rules = run.rules_snapshot or effective_rules(db)
+    tol = D(po.qty_tolerance_pct) if po.qty_tolerance_pct is not None else D(rules["tolerances"]["quantity_pct"])
+    by_no = {ln.line_no: ln for ln in po.lines}
+    over = []
+    for p in run.matching.get("pairs", []):
+        line, qty = by_no.get(p["po_line_no"]), D(p["invoice"]["quantity"])
+        if line is None or qty is None:
+            continue
+        remaining = line.quantity - consumed.get(line.id, (D("0"), D("0")))[0]
+        if qty > remaining * (1 + tol / 100):
+            over.append({"po_line_no": line.line_no, "description": line.description, "invoiced": str(qty),
+                         "remaining": str(remaining)})
+    if over:
+        detail = "; ".join(f"line {o['po_line_no']} invoices {o['invoiced']} but only {o['remaining']} remain"
+                           for o in over)
+        raise POBalanceExceeded(f"Approving would over-bill {po.po_number}: {detail}. Amend the PO or reject.", over)
+
+
 def final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str) -> dict:
+    with LedgerSection(db):
+        return _final_decision(db, invoice, decision, reason, user)
+
+
+def _final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str) -> dict:
     run = latest_run(db, invoice.id)
+    if decision == "APPROVED" and run and run.matching and run.matching.get("selected_po_id"):
+        _check_po_balance(db, invoice, run, db.get(m.PurchaseOrder, run.matching["selected_po_id"]))
     before = {"decision": invoice.decision, "decided_by": invoice.decided_by}
     invoice.decision, invoice.decided_by = decision, "HUMAN"
     _review(db, invoice, "FINAL_" + decision, before, {"decision": decision}, reason, user)

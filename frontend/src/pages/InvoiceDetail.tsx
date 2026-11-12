@@ -8,7 +8,8 @@ import DuplicatePanel from "../components/invoice/DuplicatePanel";
 import ExtractionPanel from "../components/invoice/ExtractionPanel";
 import MatchingPanel from "../components/invoice/MatchingPanel";
 import ReviewPanel from "../components/invoice/ReviewPanel";
-import { DecisionBadge, ErrorBox, Spinner, Tabs } from "../components/ui";
+import LiveRun from "../components/LiveRun";
+import { Card, DecisionBadge, ErrorBox, Spinner, Tabs } from "../components/ui";
 import { dateOnly, money } from "../format";
 
 export default function InvoiceDetail() {
@@ -28,19 +29,25 @@ export default function InvoiceDetail() {
     } catch (e) { setError(e); }
   }, [id]);
 
+  const watch = useCallback(() => {
+    window.clearInterval(timer.current);
+    timer.current = window.setInterval(async () => {
+      const n = await load();
+      if (n && !["RECEIVED", "PROCESSING"].includes(n.invoice.status)) window.clearInterval(timer.current);
+    }, 1500);
+  }, [load]);
+
   useEffect(() => {
-    load().then((d) => {
-      if (d && ["RECEIVED", "PROCESSING"].includes(d.invoice.status)) {
-        timer.current = window.setInterval(async () => {
-          const n = await load();
-          if (n && !["RECEIVED", "PROCESSING"].includes(n.invoice.status)) window.clearInterval(timer.current);
-        }, 1500);
-      }
-    });
+    load().then((d) => { if (d && ["RECEIVED", "PROCESSING"].includes(d.invoice.status)) watch(); });
     let url: string | null = null;
     api.blob(`/invoices/${id}/file`).then((b) => { url = URL.createObjectURL(b); setPdfUrl(url); }).catch(() => {});
     return () => { window.clearInterval(timer.current); if (url) URL.revokeObjectURL(url); };
-  }, [id, load]);
+  }, [id, load, watch]);
+
+  async function rerun() {
+    setError(null);
+    try { setData(await api.post(`/invoices/${id}/reprocess`, { reason: "Manual re-run" })); watch(); } catch (e) { setError(e); }
+  }
 
   async function act(fn: () => Promise<any>) {
     setBusy(true);
@@ -94,7 +101,7 @@ export default function InvoiceDetail() {
           )}
         </div>
         <div className="flex gap-2">
-          <button className="btn-secondary" disabled={busy || processing} onClick={() => act(() => api.post(`/invoices/${id}/reprocess`, { reason: "Manual re-run" }))}><RefreshCw className="h-4 w-4" />Re-run</button>
+          <button className="btn-secondary" disabled={busy || processing} onClick={rerun}><RefreshCw className="h-4 w-4" />Re-run</button>
           <button className="btn-secondary" onClick={downloadReport} disabled={!run}><Download className="h-4 w-4" />Report</button>
         </div>
       </div>
@@ -108,10 +115,12 @@ export default function InvoiceDetail() {
           </div>
         </div>
         <div className="xl:col-span-3 min-w-0 space-y-4">
-          <Tabs tabs={tabs} active={tab} onChange={setTab} />
-          {!run ? (processing ? <Spinner label="Waiting for the first processing run..." /> : <p className="text-sm text-slate-500">No processing results.</p>) : (
+          {processing && <Card title="Live run" subtitle="Each stage reports its result as soon as it finishes"><LiveRun invoiceId={id!} /></Card>}
+          {!processing && <Tabs tabs={tabs} active={tab} onChange={setTab} />}
+          {processing ? null : !run ? <p className="text-sm text-slate-500">No processing results.</p> : (
             <>
-              {tab === "decision" && <DecisionPanel data={data} onTab={setTab} />}
+              {tab === "decision" && <DecisionPanel data={data} onTab={setTab} busy={busy}
+                onConfirmPo={(po: string, reason: string) => act(() => api.post(`/invoices/${id}/confirm-po`, { po_number: po, reason }))} />}
               {tab === "extraction" && <ExtractionPanel run={run} />}
               {tab === "matching" && <MatchingPanel data={data} busy={busy} onConfirm={(po: string, reason: string) => act(() => api.post(`/invoices/${id}/confirm-po`, { po_number: po, reason }))} />}
               {tab === "duplicates" && <DuplicatePanel data={data} />}

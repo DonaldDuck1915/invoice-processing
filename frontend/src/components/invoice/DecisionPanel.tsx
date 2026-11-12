@@ -1,5 +1,6 @@
 import { ArrowRight, CheckCircle2, Flag, XCircle } from "lucide-react";
 import { AIBox, Card, DecisionBadge, Pill, StatusChip } from "../ui";
+import AIRecommendation from "./AIRecommendation";
 
 const RULE_NAMES: Record<string, string> = {
   R1: "Confirmed duplicate", R2: "Cancelled PO", R3: "Closed PO, no balance", R4: "Blocked vendor", R5: "PO belongs to another vendor",
@@ -10,7 +11,9 @@ const RULE_NAMES: Record<string, string> = {
   M15: "Unplanned charges", M16: "Processing error", M17: "Unsupported currency",
 };
 
-export default function DecisionPanel({ data, onTab }: { data: any; onTab: (t: string) => void }) {
+export default function DecisionPanel({ data, onTab, busy, onConfirmPo }: {
+  data: any; onTab: (t: string) => void; busy?: boolean; onConfirmPo?: (po: string, reason: string) => void;
+}) {
   const run = data.run;
   const d = run.decision;
   const checks: any[] = run.validation || [];
@@ -32,6 +35,10 @@ export default function DecisionPanel({ data, onTab }: { data: any; onTab: (t: s
       </div>
 
       <AIBox text={run.ai_summary?.text} error={run.ai_summary?.error} disclaimer={data.ai_disclaimer} />
+      {data.invoice.decided_by !== "HUMAN" && (
+        <AIRecommendation rec={run.ai_summary?.recommendation} disclaimer={data.ai_disclaimer} model={run.ai_summary?.model}
+          busy={busy} onTab={onTab} onConfirmPo={onConfirmPo} />
+      )}
 
       {d.reasons.length > 0 && (
         <Card title="Reasons behind the decision" subtitle="Every rule that fired, in order of precedence (reject > manual review)">

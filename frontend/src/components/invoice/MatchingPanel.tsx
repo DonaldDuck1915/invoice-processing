@@ -61,6 +61,12 @@ export default function MatchingPanel({ data, onConfirm, busy }: { data: any; on
           {m.ambiguous && <StatusChip status="MANUAL_REVIEW" />}
         </div>
         <p className="mt-2 text-sm text-slate-600">{m.explanation}</p>
+        {m.net_basis && (
+          <p className="mt-2 text-xs text-sky-700 bg-sky-50 rounded px-2 py-1">
+            Prices on this invoice include tax. They were converted to net before comparing with the PO
+            {m.net_basis.net_subtotal ? ` (net subtotal ${m.net_basis.net_subtotal})` : " (some lines had no tax rate and stayed gross)"}.
+          </p>
+        )}
         {m.issues?.length > 0 && <ul className="mt-3 space-y-1">{m.issues.filter((i: any) => i.message !== m.explanation).map((i: any, n: number) => <li key={n} className="text-xs text-slate-600"><b className="text-slate-700">{i.code.replace(/_/g, " ").toLowerCase()}</b>: {i.message}</li>)}</ul>}
         {m.candidates?.length > 0 && !m.semantic?.available && <div className="mt-3"><Note tone="warn">AI meaning signal unavailable ({m.semantic?.error}). Its weight was excluded and inferred matches require confirmation.</Note></div>}
       </Card>

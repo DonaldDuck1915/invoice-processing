@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from app import models as m
-from app.extraction.pdf_reader import DocumentError
+from app.extraction.pdf_reader import DocumentError, ocr_available
 from app.ingestion import ingest
 from app.llm import LLMClient
 from app.pipeline import confirm_po, correct_fields, final_decision, process_invoice, resolve_duplicate
@@ -14,6 +14,7 @@ from app.pipeline import confirm_po, correct_fields, final_decision, process_inv
 from .conftest import SAMPLES, FakeLLM
 
 TODAY = date(2026, 11, 10)
+needs_ocr = pytest.mark.skipif(not ocr_available(), reason="Tesseract OCR is not installed (scanned-PDF scenario)")
 
 
 def run(db, name, llm=None, filename=None):
@@ -35,6 +36,7 @@ def test_happy_path_digital_approved(db):
     assert all(not v["exceeded"] for v in r.matching["variances"])
 
 
+@needs_ocr
 def test_happy_path_scanned_ocr_approved(db):
     inv, r = run(db, "02_happy_path_scanned.pdf")
     assert inv.is_scanned
@@ -59,6 +61,7 @@ def test_ec1_split_invoices_track_cumulative_consumption(db):
     assert c.decision == "REJECTED" and "R6" in rules_of(rc)
 
 
+@needs_ocr
 def test_ec2_duplicate_with_modified_details(db):
     orig, _ = run(db, "06_ec2_original_eur.pdf")
     assert orig.decision == "APPROVED"
@@ -168,6 +171,7 @@ def test_correction_creates_new_run_and_keeps_history(db):
     assert "HUMAN_ACTION" in events and events.count("DECISION_GENERATED") == 2
 
 
+@needs_ocr
 def test_resolve_probable_duplicate_as_duplicate(db):
     run(db, "06_ec2_original_eur.pdf")
     resend, _ = run(db, "07_ec2_resend_scanned_ocr_number.pdf")

@@ -13,7 +13,7 @@ import Vendors from "./pages/Vendors";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
-  { to: "/upload", label: "Upload invoice", icon: UploadIcon },
+  { to: "/upload", label: "Process invoices", icon: UploadIcon },
   { to: "/invoices", label: "Invoices", icon: FileText },
   { to: "/purchase-orders", label: "Purchase orders", icon: Package },
   { to: "/vendors", label: "Vendors", icon: Users },
@@ -43,7 +43,9 @@ function Shell({ children, user, onLogout }: { children: ReactNode; user: any; o
         </nav>
         <div className="px-5 py-4 text-[11px] space-y-1 border-t border-slate-800">
           <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.ocr_available ? "bg-emerald-400" : "bg-slate-500"}`} />OCR {health?.ocr_available ? "ready" : "unavailable"}</div>
-          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.ai_configured ? "bg-emerald-400" : "bg-amber-400"}`} />AI {health?.ai_configured ? "enabled" : "not configured (rules only)"}</div>
+          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.ai_configured ? "bg-emerald-400" : "bg-amber-400"}`} />AI {health?.ai_configured ? `enabled · ${health.ai_provider === "gemini" ? "Gemini" : "Claude"}` : "not configured (rules only)"}</div>
+          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.email_intake ? "bg-emerald-400" : "bg-slate-500"}`} />E-mail intake {health?.email_intake ? "on" : "off"}</div>
+          {health?.insecure_defaults?.length > 0 && <div className="text-amber-300" title="Change these before sharing this instance">Demo {health.insecure_defaults.join(" & ").toLowerCase().replace(/_/g, " ")}</div>}
         </div>
         <div className="px-5 py-4 border-t border-slate-800 flex items-center justify-between">
           <div className="text-xs"><div className="text-white font-medium">{user?.name}</div><div className="text-slate-400">{user?.username}</div></div>

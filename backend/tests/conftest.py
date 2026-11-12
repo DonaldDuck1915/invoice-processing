@@ -6,6 +6,7 @@ from pathlib import Path
 _tmp = tempfile.mkdtemp(prefix="invoice-ai-test-")
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{_tmp}/test.db"
 os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["GEMINI_API_KEY"] = ""
 os.environ["SEED_ON_STARTUP"] = "false"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

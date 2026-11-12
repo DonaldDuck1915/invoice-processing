@@ -1,4 +1,4 @@
-"""Claude-based extractor. Every value must come with a verbatim source quote, which is
+"""AI extractor (Gemini or Claude). Every value must come with a verbatim source quote, which is
 verified against the document's own text before the value is trusted."""
 from __future__ import annotations
 

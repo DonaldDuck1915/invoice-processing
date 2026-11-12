@@ -55,5 +55,10 @@ export const api = {
     fd.append("file", file, (file as File).name || name);
     return request<T>(p, { method: "POST", body: fd });
   },
+  uploadMany: <T = any>(p: string, files: File[], field = "files") => {
+    const fd = new FormData();
+    files.forEach((f) => fd.append(field, f, f.name));
+    return request<T>(p, { method: "POST", body: fd });
+  },
   blob: (p: string) => request<Blob>(p),
 };

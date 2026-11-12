@@ -1,121 +1,118 @@
-import { CheckCircle2, Circle, FileUp, Loader2, XCircle } from "lucide-react";
+import { FileUp, Files, Loader2, Mail } from "lucide-react";
 import { DragEvent, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
 import { api } from "../api";
-import { Card, DecisionBadge, ErrorBox } from "../components/ui";
-import { money } from "../format";
+import LiveRun, { LiveRow } from "../components/LiveRun";
+import { Card, ErrorBox, Note } from "../components/ui";
 
-const STAGES = [
-  { id: "QUEUED", label: "Document uploaded" },
-  { id: "EXTRACTING", label: "Extracting data (text layer / OCR / AI)" },
-  { id: "VALIDATING", label: "Validating fields & arithmetic" },
-  { id: "MATCHING", label: "Identifying & matching PO" },
-  { id: "DUPLICATE_CHECK", label: "Checking for duplicates" },
-  { id: "DECIDING", label: "Applying decision rules" },
-  { id: "DONE", label: "Decision generated" },
-];
+type Queued = { id: number; filename: string };
+
+const isPdf = (f: File) => f.name.toLowerCase().endsWith(".pdf") || f.type === "application/pdf";
 
 export default function Upload() {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [preview, setPreview] = useState<string | null>(null);
-  const [invoice, setInvoice] = useState<any>(null);
+  const [queue, setQueue] = useState<Queued[]>([]);
+  const [selected, setSelected] = useState<number | null>(null);
+  const [rejected, setRejected] = useState<{ filename: string; message: string }[]>([]);
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
   const [samples, setSamples] = useState<string[]>([]);
-  const timer = useRef<number>();
+  const [email, setEmail] = useState<any>(null);
   const input = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { api.get("/admin/sample-invoices").then(setSamples).catch(() => {}); return () => window.clearInterval(timer.current); }, []);
+  useEffect(() => {
+    api.get("/admin/sample-invoices").then(setSamples).catch(() => {});
+    api.get("/admin/email").then(setEmail).catch(() => {});
+  }, []);
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
 
-  function choose(f: File | null) {
+  function choose(list: File[]) {
     setError(null);
-    setInvoice(null);
-    if (!f) return;
-    if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
-      setError(new Error("Only PDF files are supported."));
-      return;
-    }
-    setFile(f);
-    setPreview(URL.createObjectURL(f));
+    const pdfs = list.filter(isPdf);
+    if (list.length && !pdfs.length) { setError(new Error("Only PDF files are supported.")); return; }
+    if (pdfs.length < list.length) setError(new Error(`${list.length - pdfs.length} non-PDF file(s) were skipped.`));
+    setFiles(pdfs);
+    if (preview) URL.revokeObjectURL(preview);
+    setPreview(pdfs[0] ? URL.createObjectURL(pdfs[0]) : null);
   }
 
-  async function process(f = file) {
-    if (!f) return;
-    setBusy(true);
-    setError(null);
+  async function process() {
+    if (!files.length) return;
+    setBusy(true); setError(null); setRejected([]);
     try {
-      const inv = await api.upload("/invoices", f);
-      setInvoice(inv);
-      window.clearInterval(timer.current);
-      timer.current = window.setInterval(async () => {
-        try {
-          const d = await api.get(`/invoices/${inv.id}`);
-          setInvoice(d.invoice);
-          if (["PROCESSED", "FAILED"].includes(d.invoice.status)) { window.clearInterval(timer.current); setBusy(false); }
-        } catch (e) { setError(e); window.clearInterval(timer.current); setBusy(false); }
-      }, 1200);
-    } catch (e) {
-      setError(e);
-      setBusy(false);
-    }
+      let added: Queued[];
+      if (files.length === 1) {
+        const inv = await api.upload("/invoices", files[0]);
+        added = [{ id: inv.id, filename: inv.filename }];
+      } else {
+        const res = await api.uploadMany("/invoices/batch", files);
+        added = res.accepted.map((a: any) => ({ id: a.id, filename: a.filename }));
+        setRejected(res.rejected);
+      }
+      setQueue((q) => [...added, ...q]);
+      if (added[0]) setSelected(added[0].id);
+      setFiles([]);
+    } catch (e) { setError(e); } finally { setBusy(false); }
   }
 
   async function useSample(name: string) {
     const blob = await api.blob(`/admin/sample-invoices/${encodeURIComponent(name)}`);
-    const f = new File([blob], name, { type: "application/pdf" });
-    choose(f);
+    choose([new File([blob], name, { type: "application/pdf" })]);
   }
 
-  const stageIdx = invoice ? STAGES.findIndex((s) => s.id === invoice.stage) : -1;
-  const failed = invoice?.status === "FAILED";
+  async function checkInbox() {
+    setError(null);
+    try {
+      const r = await api.post("/admin/email/poll");
+      const ids: number[] = r.invoice_ids;
+      setQueue((q) => [...ids.map((id) => ({ id, filename: `E-mail invoice #${id}` })), ...q]);
+      if (ids[0]) setSelected(ids[0]);
+      if (!ids.length) setError(new Error(`Inbox checked: ${r.messages} new message(s), no new PDF invoices.`));
+      setEmail(await api.get("/admin/email"));
+    } catch (e) { setError(e); }
+  }
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-semibold text-slate-900">Upload invoice</h1>
-        <p className="text-sm text-slate-500">One PDF at a time · digital or scanned · max 10 MB, 10 pages</p>
+        <h1 className="text-xl font-semibold text-slate-900">Process invoices</h1>
+        <p className="text-sm text-slate-500">Drop one or more PDFs (digital or scanned, max 10 MB / 10 pages each). Each runs through the pipeline live.</p>
       </div>
       <div className="grid lg:grid-cols-5 gap-6">
         <div className="lg:col-span-2 space-y-6">
           <div onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
-            onDrop={(e: DragEvent) => { e.preventDefault(); setDrag(false); choose(e.dataTransfer.files?.[0] ?? null); }}
+            onDrop={(e: DragEvent) => { e.preventDefault(); setDrag(false); choose(Array.from(e.dataTransfer.files ?? [])); }}
             onClick={() => input.current?.click()}
-            className={`card cursor-pointer border-2 border-dashed p-10 text-center transition ${drag ? "border-indigo-500 bg-indigo-50" : "border-slate-300 hover:border-indigo-400"}`}>
-            <FileUp className="mx-auto h-10 w-10 text-indigo-500" />
-            <p className="mt-3 text-sm font-medium">Drop a PDF invoice here or click to browse</p>
-            <p className="text-xs text-slate-500 mt-1">{file ? file.name : "No file selected"}</p>
-            <input ref={input} type="file" accept="application/pdf,.pdf" className="hidden" onChange={(e) => choose(e.target.files?.[0] ?? null)} />
+            className={`card cursor-pointer border-2 border-dashed p-8 text-center transition ${drag ? "border-indigo-500 bg-indigo-50" : "border-slate-300 hover:border-indigo-400"}`}>
+            {files.length > 1 ? <Files className="mx-auto h-10 w-10 text-indigo-500" /> : <FileUp className="mx-auto h-10 w-10 text-indigo-500" />}
+            <p className="mt-3 text-sm font-medium">Drop PDF invoices here or click to browse</p>
+            <p className="text-xs text-slate-500 mt-1">
+              {files.length === 0 ? "No file selected" : files.length === 1 ? files[0].name : `${files.length} files selected - processed in this order`}
+            </p>
+            <input ref={input} type="file" multiple accept="application/pdf,.pdf" className="hidden" onChange={(e) => choose(Array.from(e.target.files ?? []))} />
           </div>
-          <div className="flex gap-3">
-            <button className="btn-primary" disabled={!file || busy} onClick={() => process()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}Process invoice</button>
-            {file && !busy && <button className="btn-secondary" onClick={() => { setFile(null); setPreview(null); setInvoice(null); }}>Clear</button>}
+          <div className="flex gap-3 flex-wrap">
+            <button className="btn-primary" disabled={!files.length || busy} onClick={process}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
+              {files.length > 1 ? `Process ${files.length} invoices` : "Process invoice"}
+            </button>
+            {files.length > 0 && !busy && <button className="btn-secondary" onClick={() => choose([])}>Clear</button>}
+            {email?.enabled && <button className="btn-secondary" onClick={checkInbox}><Mail className="h-4 w-4" />Check inbox now</button>}
           </div>
           <ErrorBox error={error} />
+          {rejected.length > 0 && (
+            <Note tone="warn">{rejected.map((r) => <div key={r.filename}><b>{r.filename}</b>: {r.message}</div>)}</Note>
+          )}
 
-          {invoice && (
-            <Card title="Processing status">
-              <ol className="space-y-2.5">
-                {STAGES.map((s, i) => {
-                  const done = !failed && (stageIdx > i || invoice.stage === "DONE");
-                  const active = !failed && stageIdx === i && invoice.stage !== "DONE";
-                  return (
-                    <li key={s.id} className="flex items-center gap-2.5 text-sm">
-                      {done ? <CheckCircle2 className="h-4 w-4 text-emerald-500" /> : active ? <Loader2 className="h-4 w-4 animate-spin text-indigo-500" /> : <Circle className="h-4 w-4 text-slate-300" />}
-                      <span className={done ? "text-slate-800" : active ? "text-indigo-700 font-medium" : "text-slate-400"}>{s.label}</span>
-                    </li>
-                  );
-                })}
-              </ol>
-              {failed && <div className="mt-4 flex gap-2 text-sm text-rose-700"><XCircle className="h-4 w-4 mt-0.5" />{invoice.error}</div>}
-              {invoice.status === "PROCESSED" && (
-                <div className="mt-5 rounded-lg bg-slate-50 p-4 space-y-2">
-                  <DecisionBadge decision={invoice.decision} size="lg" />
-                  <div className="text-sm text-slate-600">{invoice.vendor_name} · {invoice.invoice_number || "no number"} · {money(invoice.grand_total, invoice.currency)}</div>
-                  <Link to={`/invoices/${invoice.id}`} className="btn-primary mt-2">Open decision report</Link>
+          {queue.length > 0 && (
+            <Card title="Live run" subtitle={queue.length > 1 ? "Select an invoice to follow its stages" : "Each stage reports its result as soon as it finishes"}>
+              {queue.length > 1 && (
+                <div className="mb-4 max-h-56 overflow-auto -mx-2 space-y-0.5">
+                  {queue.map((q) => <LiveRow key={q.id} invoiceId={q.id} filename={q.filename} selected={selected === q.id} onSelect={() => setSelected(q.id)} />)}
                 </div>
               )}
+              {selected != null && <LiveRun key={selected} invoiceId={selected} />}
             </Card>
           )}
 

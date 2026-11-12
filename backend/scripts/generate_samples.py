@@ -314,7 +314,66 @@ def layout_us(c: canvas.Canvas, spec, v):
         y -= 15
 
 
-LAYOUTS = {"classic": layout_classic, "minimal": layout_minimal, "eu": layout_eu, "us": layout_us}
+def layout_inclusive(c: canvas.Canvas, spec, v):
+    """Retail-style invoice: prices INCLUDE GST; tax is only shown as 'Includes IGST @ x%'."""
+    W, H = A4
+    st = "IN"
+    lines = []
+    for code, desc, uom, qty, price, rate in spec["lines"]:
+        qty, rate = Decimal(qty), Decimal(rate)
+        gross_price = q(Decimal(price) * (1 + rate / 100))
+        lines.append({"code": code, "desc": desc, "uom": uom, "qty": qty, "price": gross_price, "rate": rate,
+                      "amount": q(qty * gross_price)})
+    gross = sum((ln["amount"] for ln in lines), Decimal("0"))
+    tax = sum((ln["amount"] - q(ln["amount"] / (1 + ln["rate"] / 100)) for ln in lines), Decimal("0"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, H - 50, v["name"])
+    c.setFont("Helvetica", 9)
+    c.drawString(40, H - 64, v["address"])
+    c.drawString(40, H - 77, f"GSTIN: {v['tax_id']}")
+    c.setFont("Helvetica-Bold", 12)
+    c.drawRightString(560, H - 50, "TAX INVOICE")
+    c.setFont("Helvetica", 10)
+    y = H - 110
+    for t in [f"Invoice No: {spec['number']}", f"Invoice Date: {spec['date']}", f"PO No: {spec['po']}",
+              f"Currency: {spec['currency']}"]:
+        c.drawString(40, y, t)
+        y -= 14
+    c.drawString(330, H - 110, "Bill To:")
+    c.drawString(330, H - 124, COMPANY["name"])
+    c.drawString(330, H - 138, f"GSTIN: {COMPANY['gstin']}")
+    y -= 6
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(40, y, "All prices are inclusive of GST.")
+    y -= 22
+    cols = [(40, "Item Code", "l"), (120, "Description", "l"), (330, "Qty", "r"), (345, "UOM", "l"),
+            (440, "Rate", "r"), (500, "GST %", "r"), (560, "Amount", "r")]
+    c.setFont("Helvetica-Bold", 9)
+    for x, label, a in cols:
+        (c.drawString if a == "l" else c.drawRightString)(x, y, label)
+    y -= 18
+    c.setFont("Helvetica", 9)
+    for ln in lines:
+        c.drawString(40, y, ln["code"])
+        c.drawString(120, y, ln["desc"][:40])
+        c.drawRightString(330, y, fmt_qty(ln["qty"]))
+        c.drawString(345, y, ln["uom"])
+        c.drawRightString(440, y, fmt(ln["price"], st))
+        c.drawRightString(500, y, fmt_qty(ln["rate"]))
+        c.drawRightString(560, y, fmt(ln["amount"], st))
+        y -= 15
+    y -= 15
+    c.setFont("Helvetica", 10)
+    for label, val, bold in [("Sub Total", gross, False), (f"Grand Total ({spec['currency']})", gross, True),
+                             (f"Includes IGST @ {fmt_qty(lines[0]['rate'])}%", tax, False)]:
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
+        c.drawString(330, y, label)
+        c.drawRightString(560, y, fmt(val, st))
+        y -= 15
+
+
+LAYOUTS = {"classic": layout_classic, "minimal": layout_minimal, "eu": layout_eu, "us": layout_us,
+           "inclusive": layout_inclusive}
 
 
 def render_pdf(spec) -> bytes:
@@ -440,15 +499,23 @@ SCENARIOS = [
      "date": "09/11/2026", "po": "PO-2010", "currency": "INR", "tax_mode": "CGST_SGST",
      "lines": [("SVC-HK-M", "Housekeeping services - deep clean", "MONTH", "1", "40000", "18")], "scan": "poor",
      "expect": "MANUAL_REVIEW", "story": "Barely legible scan - low OCR confidence."},
+    # ---- EC5 tax embedded in the prices
+    {"file": "23_ec5_tax_inclusive_prices.pdf", "layout": "inclusive", "vendor": "V004", "number": "TN/26-27/0457",
+     "date": "06/11/2026", "po": "PO-2011", "currency": "INR", "lines": po_lines("PO-2011"), "expect": "APPROVED",
+     "story": "Prices include 18% GST (2,950 per stand vs PO 2,500 net). Net values are derived before matching, "
+              "so it is not mistaken for an 18% price variance."},
 ]
 
 
-def main(out_dir: str | None = None):
+def main(out_dir: str | None = None, only: list[str] | None = None):
     out = Path(out_dir or Path(__file__).resolve().parents[1] / "samples")
     out.mkdir(parents=True, exist_ok=True)
     readme = ["# Demo invoices", "", "Upload in numeric order (some scenarios depend on earlier ones).", "",
               "| File | Expected | Scenario |", "|---|---|---|"]
     for spec in SCENARIOS:
+        if only and spec["file"] not in only:
+            readme.append(f"| {spec['file']} | {spec['expect']} | {spec['story']} |")
+            continue
         data = render_pdf(spec)
         if spec.get("scan"):
             data = scan(data, spec["scan"])
