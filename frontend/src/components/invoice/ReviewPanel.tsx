@@ -5,7 +5,7 @@ import { FIELD_LABELS, dateTime, money } from "../../format";
 import { Card, Note, StatusChip } from "../ui";
 
 const EDITABLE = ["vendor_name", "vendor_tax_id", "invoice_number", "invoice_date", "due_date", "po_number", "currency",
-  "subtotal", "taxable_amount", "discount", "tax_amount", "shipping", "grand_total"];
+  "subtotal", "taxable_amount", "discount", "tax_amount", "shipping", "grand_total", "document_type", "original_invoice_number", "bank_account", "bank_ifsc", "irn"];
 const LINE_COLS = ["description", "item_code", "quantity", "uom", "unit_price", "tax_rate", "line_total"];
 
 export default function ReviewPanel({ data, busy, act, id }: { data: any; busy: boolean; act: (fn: () => Promise<any>) => void; id: string }) {
@@ -22,6 +22,7 @@ export default function ReviewPanel({ data, busy, act, id }: { data: any; busy: 
   const [poReason, setPoReason] = useState("");
   const [dupReason, setDupReason] = useState("");
   const [finalReason, setFinalReason] = useState("");
+  const managerOnly = Boolean(data.manager_required) && data.viewer?.role !== "MANAGER";
 
   const changed = useMemo(() => Object.fromEntries(EDITABLE.filter((n) => (ex.fields[n]?.value ?? "") !== fields[n]).map((n) => [n, fields[n] === "" ? null : fields[n]])), [fields, ex]);
   const dup = run.duplicates;
@@ -72,6 +73,13 @@ export default function ReviewPanel({ data, busy, act, id }: { data: any; busy: 
           <button className="btn-primary whitespace-nowrap" disabled={busy || corrReason.trim().length < 3 || (Object.keys(changed).length === 0 && !editLines)}
             onClick={() => act(() => api.patch(`/invoices/${id}/fields`, { fields: changed, line_items: editLines ? lines : null, reason: corrReason }))}>Save & re-run</button>
         </div>
+        <p className="mt-1.5 text-xs text-slate-500">
+          {Object.keys(changed).length === 0 && !editLines
+            ? <>Nothing to save yet - change a field above (or the line items) first. Empty fields that are not printed on the invoice can stay empty. To re-check the invoice without changes, use <b>Re-run</b> at the top; to accept it as it is, use <b>4. Final decision</b> below.</>
+            : corrReason.trim().length < 3
+              ? `${Object.keys(changed).length || "Line item"} change(s) ready - enter a reason (at least 3 characters) to save.`
+              : `Will save ${Object.keys(changed).length ? `${Object.keys(changed).length} field change(s)` : ""}${Object.keys(changed).length && editLines ? " and " : ""}${editLines ? "the line items" : ""} and re-run the checks.`}
+        </p>
       </Card>
 
       <Card title="2. Confirm the purchase order" subtitle={run.matching?.selected_po ? `Currently matched: ${run.matching.selected_po} (${run.matching.method.replace(/_/g, " ").toLowerCase()})` : "No PO selected by the system"}>
@@ -100,9 +108,11 @@ export default function ReviewPanel({ data, busy, act, id }: { data: any; busy: 
       <Card title="4. Final decision" subtitle="Records an authorised human decision. Approving consumes PO balance (if a PO is linked); rejecting releases it.">
         <div className="flex flex-wrap gap-2">
           <input className="input flex-1 min-w-[200px]" placeholder="Reason (required, e.g. 'price increase approved by procurement, mail 12-Oct')" value={finalReason} onChange={(e) => setFinalReason(e.target.value)} />
-          <button className="btn-success" disabled={busy || finalReason.trim().length < 3 || inv.status !== "PROCESSED"} onClick={() => act(() => api.post(`/invoices/${id}/final-decision`, { decision: "APPROVED", reason: finalReason }))}><CheckCircle2 className="h-4 w-4" />Approve</button>
+          <button className="btn-success" title={managerOnly ? "Above the auto-approval limit - only a manager can approve" : undefined}
+            disabled={busy || managerOnly || finalReason.trim().length < 3 || inv.status !== "PROCESSED"} onClick={() => act(() => api.post(`/invoices/${id}/final-decision`, { decision: "APPROVED", reason: finalReason }))}><CheckCircle2 className="h-4 w-4" />Approve</button>
           <button className="btn-danger" disabled={busy || finalReason.trim().length < 3 || inv.status !== "PROCESSED"} onClick={() => act(() => api.post(`/invoices/${id}/final-decision`, { decision: "REJECTED", reason: finalReason }))}><XCircle className="h-4 w-4" />Reject</button>
         </div>
+        {managerOnly && <div className="mt-3"><Note tone="warn">{run.controls?.approval?.message || "This invoice needs manager approval."} Sign in as a manager to approve; you can still reject or correct it.</Note></div>}
         {!run.matching?.selected_po && <div className="mt-3"><Note tone="warn">No PO is linked. Approving now will not consume any PO balance - confirm a PO first if one applies.</Note></div>}
       </Card>
 

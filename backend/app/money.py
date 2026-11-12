@@ -11,8 +11,18 @@ CURRENCY_SYMBOLS = {
     "₹": "INR", "RS.": "INR", "RS": "INR", "INR": "INR", "RUPEES": "INR",
     "€": "EUR", "EUR": "EUR", "EURO": "EUR", "EUROS": "EUR",
     "$": "USD", "USD": "USD", "US$": "USD", "DOLLARS": "USD",
+    "£": "GBP", "GBP": "GBP", "AED": "AED", "SGD": "SGD", "AUD": "AUD", "CAD": "CAD", "CHF": "CHF",
+    "JPY": "JPY", "CNY": "CNY", "SAR": "SAR", "HKD": "HKD", "NZD": "NZD",
 }
+# Built in; more currencies are enabled by giving them an approval limit on the Rules & data page.
 SUPPORTED_CURRENCIES = {"INR", "EUR", "USD"}
+SYMBOLS = {"INR": "₹", "EUR": "€", "USD": "$", "GBP": "£"}
+
+
+def supported_currencies(rules: dict | None = None) -> set[str]:
+    """Built-in currencies plus every currency that has an approval limit configured."""
+    limits = ((rules or {}).get("approval") or {}).get("auto_approve_limit") or {}
+    return SUPPORTED_CURRENCIES | {c for c, v in limits.items() if v is not None}
 
 
 def D(value) -> Decimal | None:
@@ -128,5 +138,5 @@ def fmt_money(value: Decimal | None, currency: str | None = None) -> str:
             whole = f"{head},{tail}"
     else:
         whole = f"{int(whole):,}"
-    sym = {"INR": "₹", "EUR": "€", "USD": "$"}.get(currency or "", "")
+    sym = SYMBOLS.get(currency or "", f"{currency} " if currency else "")
     return f"{sign}{sym}{whole}.{frac}"

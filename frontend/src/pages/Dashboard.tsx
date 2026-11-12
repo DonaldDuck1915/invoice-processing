@@ -48,6 +48,14 @@ export default function Dashboard() {
         <Stat label="Rejected" value={stats.rejected} icon={XCircle} tone="bg-rose-50 text-rose-600" to="/invoices?decision=REJECTED" />
         <Stat label="Awaiting manual review" value={stats.manual_review} icon={AlertTriangle} tone="bg-amber-50 text-amber-600" to="/invoices?decision=MANUAL_REVIEW" />
       </div>
+      {(stats.awaiting_manager > 0 || stats.risk_flagged > 0 || stats.notes > 0 || Number(stats.tds_withheld?.INR) > 0) && (
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-slate-600 -mt-2">
+          {stats.awaiting_manager > 0 && <span><b className="text-violet-700">{stats.awaiting_manager}</b> above the approval limit, waiting for a manager</span>}
+          {stats.risk_flagged > 0 && <span><b className="text-rose-700">{stats.risk_flagged}</b> with fraud / risk signals</span>}
+          {stats.notes > 0 && <span><b>{stats.notes}</b> credit / debit note(s)</span>}
+          {Number(stats.tds_withheld?.INR) > 0 && <span>TDS withheld on approved invoices: <b>{money(stats.tds_withheld.INR, "INR")}</b></span>}
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-3 gap-6">
         <Card title="Total invoice value" subtitle="Grand totals by currency (no conversion)">
@@ -65,6 +73,13 @@ export default function Dashboard() {
                 </div>
               ))}
               {stats.human_decided > 0 && <p className="text-xs text-slate-500">{stats.human_decided} decision(s) made by a reviewer.</p>}
+            </div>
+          )}
+          {stats.ai_usage?.calls > 0 && (
+            <div className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500 space-y-0.5">
+              <div className="font-medium text-slate-700">AI usage</div>
+              <div>{stats.ai_usage.calls} call(s) over {stats.ai_usage.runs} run(s) · {(stats.ai_usage.input_tokens + stats.ai_usage.output_tokens).toLocaleString()} tokens</div>
+              {stats.ai_usage.cost_usd != null && <div>≈ ${stats.ai_usage.cost_usd.toFixed(4)} total · ${stats.ai_usage.avg_cost_per_run_usd.toFixed(5)} per run</div>}
             </div>
           )}
         </Card>

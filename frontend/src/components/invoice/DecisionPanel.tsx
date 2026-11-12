@@ -1,4 +1,4 @@
-import { ArrowRight, CheckCircle2, Flag, XCircle } from "lucide-react";
+import { ArrowRight, CheckCircle2, Flag, UserCheck, XCircle } from "lucide-react";
 import { AIBox, Card, DecisionBadge, Pill, StatusChip } from "../ui";
 import AIRecommendation from "./AIRecommendation";
 
@@ -9,6 +9,9 @@ const RULE_NAMES: Record<string, string> = {
   M7: "Calculation inconsistency", M8: "Currency mismatch", M9: "Vendor needs verification", M10: "Unmatched invoice line",
   M11: "Date anomaly", M12: "Closed PO with balance", M13: "PO reference corrected", M14: "Tax inconsistency",
   M15: "Unplanned charges", M16: "Processing error", M17: "Unsupported currency",
+  M18: "Above auto-approval limit", M19: "Approval-limit pattern", M20: "Bank details changed", M21: "Unusual amount",
+  M22: "Invoice predates PO", M23: "GST e-invoice", M24: "Credit/debit note link", M25: "Vendor debit note",
+  R8: "AP control (reject policy)",
 };
 
 export default function DecisionPanel({ data, onTab, busy, onConfirmPo }: {
@@ -28,13 +31,24 @@ export default function DecisionPanel({ data, onTab, busy, onConfirmPo }: {
             <span className="text-xs text-slate-500">System decision · run {run.run_no}</span>
           </div>
           {d.flags?.length > 0 && <div className="flex gap-1.5 flex-wrap">{d.flags.map((f: string) => (
-            <Pill key={f} className={f.startsWith("VENDOR_") || f.includes("DUPLICATE") ? "bg-rose-100 text-rose-700 ring-rose-600/20" : "bg-white text-slate-600 ring-slate-300"}><Flag className="h-3 w-3" />{f.replace(/_/g, " ").toLowerCase()}</Pill>))}</div>}
+            <Pill key={f} className={f.startsWith("VENDOR_") || f.includes("DUPLICATE") || ["BANK_DETAILS_CHANGED", "EINVOICE_MISMATCH", "SPLIT_BELOW_LIMIT"].includes(f) ? "bg-rose-100 text-rose-700 ring-rose-600/20" : "bg-white text-slate-600 ring-slate-300"}><Flag className="h-3 w-3" />{f.replace(/_/g, " ").toLowerCase()}</Pill>))}</div>}
         </div>
         <p className="mt-3 text-sm text-slate-800 leading-relaxed">{d.summary}</p>
+        {d.approval_level && d.approval_level !== "AUTO" && d.decision !== "REJECTED" && (
+          <div className={`mt-2 flex items-center gap-2 text-sm ${data.manager_required ? "text-violet-800" : "text-amber-800"}`}><UserCheck className="h-4 w-4" />
+            <b>{data.manager_required ? "Manager approval required." : "Above the auto-approval limit - a reviewer or manager can approve it."}</b>
+            <button className="text-xs text-indigo-600 hover:underline" onClick={() => onTab("controls")}>Why?</button></div>
+        )}
         <div className="mt-3 flex items-start gap-2 text-sm"><ArrowRight className="h-4 w-4 mt-0.5 text-indigo-600 shrink-0" /><span><b>Recommended next action:</b> {d.next_action}</span></div>
       </div>
 
       <AIBox text={run.ai_summary?.text} error={run.ai_summary?.error} disclaimer={data.ai_disclaimer} />
+      {run.ai_usage?.calls > 0 && (
+        <p className="-mt-2 text-[11px] text-slate-400">
+          AI this run: {run.ai_usage.calls} call(s) · {(run.ai_usage.input_tokens + run.ai_usage.output_tokens).toLocaleString()} tokens
+          {run.ai_usage.cost_usd != null && ` · ≈ $${run.ai_usage.cost_usd.toFixed(5)}`}
+        </p>
+      )}
       {data.invoice.decided_by !== "HUMAN" && (
         <AIRecommendation rec={run.ai_summary?.recommendation} disclaimer={data.ai_disclaimer} model={run.ai_summary?.model}
           busy={busy} onTab={onTab} onConfirmPo={onConfirmPo} />

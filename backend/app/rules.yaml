@@ -32,6 +32,54 @@ policy:
   price_over_tolerance: MANUAL_REVIEW
   total_over_tolerance: MANUAL_REVIEW
   allow_under_billing: true          # lower price / partial qty is not a violation
+  # AP controls (MANUAL_REVIEW or REJECT; the two marked FLAG may also be FLAG = shown, no review)
+  above_approval_limit: MANUAL_REVIEW   # routed to a manager; only a manager can approve it
+  near_limit: FLAG                      # just under the auto-approval limit
+  split_below_limit: MANUAL_REVIEW      # several just-under-limit invoices from one vendor in a short window
+  bank_details_changed: MANUAL_REVIEW
+  unusual_amount: MANUAL_REVIEW
+  invoice_before_po: MANUAL_REVIEW
+  month_end_arrival: FLAG
+  einvoice_missing: MANUAL_REVIEW       # vendor must e-invoice but no IRN / QR code
+  einvoice_mismatch: MANUAL_REVIEW      # IRN invalid, or QR code contradicts the printed invoice
+  note_without_original: MANUAL_REVIEW  # credit/debit note whose original invoice is unknown or not approved
+  credit_exceeds_original: MANUAL_REVIEW
+  debit_note: MANUAL_REVIEW             # a vendor debit note raises what we owe - buyer confirms it
+
+approval:
+  # Gross amount (invoice currency) up to which an invoice may be approved automatically.
+  # Above it the invoice goes to review and only a manager can approve it. Credit notes are exempt.
+  auto_approve_limit:
+    INR: 500000
+    EUR: 15000
+    USD: 15000
+  # Who may approve an invoice the limit sends to review (above the limit, no limit for its currency,
+  # or a suspected split): REVIEWER (reviewer or manager) or MANAGER (manager only).
+  above_limit_approver: REVIEWER
+  near_limit_pct: 5           # within 5% below the limit counts as "just under"
+  split_window_days: 30       # look-back for other just-under-limit invoices from the same vendor
+
+fraud:
+  unusual_amount_multiple: 3  # more than 3x the vendor's median invoice ...
+  unusual_amount_min_history: 3  # ... once at least this many earlier invoices exist
+  month_end_days: 2           # received in the last 2 days of a month
+
+notes:
+  amount_abs: 1.00            # rounding allowance when comparing a note with its original invoice
+  line_min_similarity: 0.60   # credit-note line -> original invoice line
+
+einvoice:
+  enabled: true               # GST e-invoicing checks (India). Vendors flagged in master data must send IRN + QR.
+
+tds:
+  # Indian TDS withheld from the vendor payment. Base = value excluding GST. Rates/thresholds are
+  # configurable defaults - confirm them with your tax team for the current financial year.
+  enabled: true
+  sections:
+    "194C": {rate: 2, single_threshold: 30000, annual_threshold: 100000, excess_only: false}   # contractors
+    "194J": {rate: 10, single_threshold: 0, annual_threshold: 50000, excess_only: false}       # professional / technical
+    "194I": {rate: 10, single_threshold: 0, annual_threshold: 600000, excess_only: false}      # rent
+    "194Q": {rate: 0.1, single_threshold: 0, annual_threshold: 5000000, excess_only: true}     # purchase of goods
 
 matching:
   select_min_score: 70       # top candidate must score at least this

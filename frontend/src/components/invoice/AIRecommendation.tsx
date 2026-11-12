@@ -61,7 +61,7 @@ export default function AIRecommendation({ rec, disclaimer, model, busy, onTab, 
         )}
         <button className="btn-secondary" onClick={() => onTab(tab)}>{tabLabel}</button>
       </div>
-      <p className="mt-2 text-[11px] text-indigo-600/80">Advisory only{model ? ` · ${model}` : ""} - the rule engine made the decision and nothing is applied without you. {disclaimer}</p>
+      <p className="mt-2 text-[11px] text-indigo-600/80">Advisory only -the rule engine made the decision and nothing is applied without you. {disclaimer}</p>
     </div>
   );
 }

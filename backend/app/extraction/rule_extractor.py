@@ -23,7 +23,15 @@ RX_DATE_GENERIC = re.compile(r"(?<!due\s)(?<!po\s)(?<!order\s)\bdated?\s*[:\-]\s
 RX_DUE_DATE = re.compile(r"\b(?:due\s*date|payment\s*due|due\s*on|pay\s*by)\s*[:\-]?\s*(.+)", re.I)
 RX_PO = re.compile(r"\b(?:p\.?\s?o\.?|purchase\s*order|order)\s*(?:no|number|ref(?:erence)?|#)?\.?\s*[:#\-]?\s*" + _ID, re.I)
 RX_VENDOR_LABEL = re.compile(r"^\s*(?:supplier|vendor|from|seller|sold\s*by|billed\s*by)\s*[:\-]\s*(.+)", re.I)
-RX_CURRENCY_LABEL = re.compile(r"\bcurrency\s*[:\-]?\s*(INR|EUR|USD)\b", re.I)
+RX_NOTE_TITLE = re.compile(r"\b(credit|debit)\s*note\b", re.I)
+RX_NOTE_NO = re.compile(r"\b(?:credit|debit)\s*note\s*(?:no|number|num|#)\.?\s*[:#\-]?\s*" + _ID, re.I)
+RX_ORIGINAL_INVOICE = re.compile(r"\b(?:against|ref(?:erence)?\.?\s*(?:to)?|original|orig\.?)\s*(?:tax\s+)?(?:invoice|inv|bill)"
+                                 r"\s*(?:no|number|num|#)?\.?\s*[:#\-]?\s*" + _ID, re.I)
+RX_IRN = re.compile(r"\bIRN\s*(?:no\.?)?\s*[:\-]?\s*([0-9a-fA-F]{64})\b")
+RX_BANK_ACCOUNT = re.compile(r"\b(?:a/?c|account|acct)\.?\s*(?:no|number|num|#)\.?\s*[:\-]?\s*([0-9][0-9\s\-]{7,22}[0-9])", re.I)
+RX_IBAN = re.compile(r"\bIBAN\s*[:\-]?\s*([A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,3})?)", re.I)
+RX_IFSC = re.compile(r"\b(?:IFSC|SWIFT|BIC|routing)\s*(?:code|no\.?|number)?\s*[:\-]?\s*([A-Z0-9]{8,11})\b", re.I)
+RX_CURRENCY_LABEL = re.compile(r"\b(?i:currency)\s*[:\-]?\s*([A-Z]{3})\b")  # any ISO 4217 code after "Currency:"
 
 RX_SUBTOTAL = re.compile(r"\bsub\s*-?\s*total\b", re.I)
 RX_TAXABLE = re.compile(r"\btaxable\s*(?:value|amount)?\b", re.I)
@@ -265,8 +273,31 @@ def extract_with_rules(doc: DocumentText, company_tax_ids: list[str] | None = No
                                 "Taken from the document heading (no explicit label).", 0.8)
                             if name else _missing())
 
-    # --- invoice number ---
-    hit = _first(segs, RX_INVOICE_NO, need_digit=True)
+    # --- document type (invoice / credit note / debit note) and, for notes, the original invoice ---
+    kind = None
+    for ln in lines[:12]:
+        mm = RX_NOTE_TITLE.search(ln.text)
+        if mm:
+            kind = (mm.group(1).upper() + "_NOTE", ln)
+            break
+    if kind:
+        f["document_type"] = _fv(kind[0], kind[1].text.strip()[:40], kind[1].conf, kind[1].page, src)
+    else:
+        f["document_type"] = FieldValue(value="INVOICE", confidence=0.5, status="DERIVED", source="derived",
+                                        note="No credit/debit note title found; treated as an invoice.")
+    orig = _first(segs, RX_ORIGINAL_INVOICE, need_digit=True)
+    if orig:
+        mm, ln = orig
+        raw = mm.group(1).strip().rstrip(".-/")
+        f["original_invoice_number"] = _fv(raw.upper(), raw, ln.conf, ln.page, src)
+    else:
+        f["original_invoice_number"] = _missing("No reference to an original invoice." if kind else None)
+
+    # --- invoice number (for a note: the note's own number) ---
+    hit = _first(segs, RX_NOTE_NO, need_digit=True) if kind else None
+    if not hit:
+        hit = next(((mm, ln) for ln in segs for mm in RX_INVOICE_NO.finditer(ln.text)
+                    if re.search(r"\d", mm.group(1)) and not RX_ORIGINAL_INVOICE.search(ln.text)), None)
     if hit:
         m, ln = hit
         raw = m.group(1).strip().rstrip(".-/")
@@ -384,6 +415,27 @@ def extract_with_rules(doc: DocumentText, company_tax_ids: list[str] | None = No
                                      note="Sum of printed tax components (no total-tax line).")
     else:
         f["tax_amount"] = _missing()
+
+    # --- payment details and e-invoice reference ---
+    def simple(rx, clean):
+        h = _first(segs, rx)
+        if not h:
+            return _missing()
+        mm, ln = h
+        return _fv(clean(mm.group(1)), mm.group(1).strip(), ln.conf, ln.page, src)
+
+    nospace = lambda v: re.sub(r"[\s\-]", "", v).upper()  # noqa: E731
+    f["bank_account"] = simple(RX_IBAN, nospace)
+    if f["bank_account"].value is None:
+        f["bank_account"] = simple(RX_BANK_ACCOUNT, nospace)
+    f["bank_ifsc"] = simple(RX_IFSC, nospace)
+    irn = None
+    for ln in lines:  # the IRN is a long token; read it from the full line, not a column segment
+        mm = RX_IRN.search(ln.text.replace(" ", "")) or RX_IRN.search(ln.text)
+        if mm:
+            irn = _fv(mm.group(1).lower(), mm.group(1), ln.conf, ln.page, src)
+            break
+    f["irn"] = irn or _missing()
 
     incl = detect_tax_inclusive(full)
     inv.meta = {

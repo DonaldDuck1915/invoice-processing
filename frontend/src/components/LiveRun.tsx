@@ -8,11 +8,12 @@ import { DecisionBadge } from "./ui";
 /** Pipeline stages in order, with the audit events each stage writes. The backend commits after
  *  every stage, so polling /progress shows each stage's result as soon as it finishes. */
 export const STAGES = [
-  { id: "QUEUED", label: "Document received", events: ["DOCUMENT_UPLOADED", "RECEIVED_BY_EMAIL", "PROCESSING_RESUMED", "PROCESSING_STARTED"] },
+  { id: "QUEUED", label: "Document received", events: ["DOCUMENT_UPLOADED", "IMAGE_CONVERTED", "RECEIVED_BY_EMAIL", "PROCESSING_RESUMED", "PROCESSING_STARTED"] },
   { id: "EXTRACTING", label: "Extract data (text layer / OCR / AI)", events: ["DATA_EXTRACTED", "EXTRACTION_REUSED", "CORRECTIONS_APPLIED", "TAX_INCLUSIVE_DETECTED"] },
   { id: "VALIDATING", label: "Validate fields & arithmetic", events: ["VALIDATION_COMPLETED"] },
   { id: "MATCHING", label: "Identify & match purchase order", events: ["PO_CANDIDATES_RANKED", "PO_IDENTIFIED", "PO_NOT_IDENTIFIED", "MATCHING_COMPLETED"] },
   { id: "DUPLICATE_CHECK", label: "Check for duplicates", events: ["DUPLICATE_CHECK_COMPLETED"] },
+  { id: "CONTROLS", label: "AP controls: approval limit, fraud signals, e-invoice, TDS", events: ["NOTE_LINKED", "NOTE_ORIGINAL_MISSING", "CONTROLS_COMPLETED"] },
   { id: "DECIDING", label: "Apply decision rules & update PO ledger", events: ["DECISION_GENERATED", "HUMAN_DECISION_KEPT", "PO_CONSUMPTION_RECORDED", "PO_CONSUMPTION_REVERSED"] },
   { id: "SUMMARISING", label: "Write summary", events: ["AI_SUMMARY_GENERATED"] },
 ] as const;

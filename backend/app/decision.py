@@ -36,6 +36,15 @@ NEXT_ACTIONS = {
     "M15": "Confirm whether freight/other charges were agreed.",
     "M16": "Review the document manually; automatic extraction failed.",
     "M17": "Confirm the invoice currency.",
+    "M18": "Approve or reject it manually: the auto-approval limit does not allow automatic approval.",
+    "M19": "Check whether one purchase was split into several invoices to stay below the approval limit.",
+    "M20": "Do not pay to the new account until the change is confirmed with the vendor on a known phone number.",
+    "M21": "Confirm the unusually large amount with the buyer / procurement before paying.",
+    "M22": "Ask procurement why the invoice predates the PO (retro PO) and get it approved.",
+    "M23": "Ask the vendor for a valid GST e-invoice (IRN + signed QR code) before claiming input tax credit.",
+    "M24": "Link the note to the correct, approved original invoice (or correct its amounts) and re-run.",
+    "M25": "Confirm the debit note's reason with the buyer, then approve or reject it.",
+    "R8": "Return the document to the vendor.",
 }
 
 
@@ -44,7 +53,8 @@ def _reliable(inv: ExtractedInvoice, *names: str) -> bool:
 
 
 def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, match: dict, dup: dict,
-           rules: dict, duplicate_resolution: str | None = None, stage_errors: list[str] | None = None) -> Decision:
+           rules: dict, duplicate_resolution: str | None = None, stage_errors: list[str] | None = None,
+           controls: dict | None = None) -> Decision:
     pol = rules["policy"]
     hits: list[RuleHit] = []
     issues = {i["code"]: i for i in match.get("issues", [])}
@@ -117,7 +127,8 @@ def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, m
     for code, rule in [("PO_AMBIGUOUS", "M3"), ("PO_NOT_IDENTIFIED", "M3"), ("PO_NOT_FOUND", "M3")]:
         if code in issues and not match.get("selected_po"):
             hit(rule, "MANUAL_REVIEW", issues[code]["message"], issues[code].get("evidence"))
-    if not match.get("selected_po") and not any(h.rule in ("M3", "R5") for h in hits):
+    is_note = match.get("method") == "VIA_ORIGINAL_INVOICE"
+    if not is_note and not match.get("selected_po") and not any(h.rule in ("M3", "R5") for h in hits):
         hit("M3", "MANUAL_REVIEW", match.get("explanation") or "No purchase order could be identified.")
     if dup["status"] == "PROBABLE" and duplicate_resolution != "NOT_DUPLICATE" and not any(h.rule == "M4" for h in hits):
         hit("M4", "MANUAL_REVIEW", dup["explanation"], {"matched_invoice_id": dup["best"]["invoice_id"],
@@ -140,6 +151,18 @@ def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, m
             hit("R7", "REJECT", i["message"], i.get("evidence"))
         else:
             hit(rule, "MANUAL_REVIEW", i["message"], i.get("evidence"))
+    # ---------------------------------------------------------------- AP controls
+    unreliable_by_code = {"BANK_DETAILS_CHANGED": not _reliable(inv, "bank_account"),
+                          "EINVOICE_MISMATCH": not _reliable(inv, "irn", "grand_total", "invoice_number")}
+    for i in (controls or {}).get("issues", []):
+        if i["outcome"] == "FLAG":
+            flags.append(i["code"])
+            continue
+        outcome = "REJECT" if i["outcome"] == "REJECT" else "MANUAL_REVIEW"
+        hit(i["rule"] if outcome == "MANUAL_REVIEW" else "R8", outcome, i["message"], i.get("evidence"),
+            unreliable=unreliable_by_code.get(i["code"], False))
+        flags.append(i["code"])
+    approval = (controls or {}).get("approval") or {}
     for err in stage_errors or []:
         hit("M16", "MANUAL_REVIEW", err)
     if inv.field("currency").value is None:
@@ -173,6 +196,8 @@ def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, m
         top = "; ".join(h.message.rstrip(".") for h in _dedupe(reviews)[:3])
         summary = f"Manual review needed: {top}."
         next_action = NEXT_ACTIONS.get(_dedupe(reviews)[0].rule, "Review the flagged items.")
+        if _dedupe(reviews)[0].rule == "M18" and approval.get("level") == "MANAGER":
+            next_action = "Route to a manager: the auto-approval limit requires a manager's approval."
     else:
         decision = "APPROVED"
         n_var = sum(1 for x in match.get("variances", []) if not x["exceeded"])
@@ -180,8 +205,26 @@ def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, m
                    f"({match['method'].replace('_', ' ').lower()} match); {len(passed)} checks passed and all "
                    f"{n_var} variances are within tolerance; no duplicate found.")
         next_action = "Post the invoice for payment on its due date."
+        tds = (controls or {}).get("tds") or {}
+        if tds.get("applicable") and D_(tds.get("amount")):
+            next_action = (f"Post for payment: pay the vendor {fmt_money(_dec(tds['net_payable']), cur)} and deposit TDS "
+                           f"{fmt_money(_dec(tds['amount']), cur)} under section {tds['section']}.")
+        if is_note:
+            kind = (controls or {}).get("document_type", "CREDIT_NOTE")
+            summary = (f"Approved: {'credit' if kind == 'CREDIT_NOTE' else 'debit'} note {ref} from {vendor_name} for "
+                       f"{total}. {match.get('explanation') or ''}").strip()
+            next_action = ("Apply the credit against the vendor's next payment." if kind == "CREDIT_NOTE"
+                           else "Pay the debit note together with the original invoice.")
     return Decision(decision=decision, summary=summary, reasons=_dedupe(rejects) + _dedupe(reviews),
-                    passed_checks=passed, failed_checks=failed, next_action=next_action, flags=sorted(set(flags)))
+                    passed_checks=passed, failed_checks=failed, next_action=next_action, flags=sorted(set(flags)),
+                    approval_level=approval.get("level", "AUTO"))
+
+
+def D_(v):
+    from .money import D
+
+    x = D(v)
+    return x is not None and x != 0
 
 
 def _dec(v):

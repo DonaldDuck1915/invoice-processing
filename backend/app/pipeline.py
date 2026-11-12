@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from . import models as m
 from .audit import log
+from .controls import run_controls
 from .config import deep_merge, get_settings, load_default_rules, rules_hash
 from .decision import decide
 from .duplicates import check_duplicates, fingerprint
@@ -29,6 +30,7 @@ from .matching.po_matcher import match_po
 from .matching.semantic import SemanticScorer
 from .matching.vendor import resolve_vendor
 from .money import D
+from .notes import document_type, process_note
 from .schemas import ExtractedInvoice
 from .summary import ai_summary
 from .tax_mode import net_view
@@ -65,6 +67,12 @@ class LedgerSection:
             _LEDGER_LOCK.release()
 
 
+class ManagerApprovalRequired(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 class POBalanceExceeded(Exception):
     def __init__(self, message: str, evidence: list[dict]):
         super().__init__(message)
@@ -90,7 +98,9 @@ def latest_run(db: Session, invoice_id: int) -> m.ProcessingRun | None:
 
 def _vendor_dict(v: m.Vendor) -> dict:
     return {"id": v.id, "code": v.code, "name": v.name, "tax_id": v.tax_id, "tax_id_type": v.tax_id_type,
-            "country": v.country, "status": v.status, "default_currency": v.default_currency}
+            "country": v.country, "status": v.status, "default_currency": v.default_currency,
+            "bank_account": v.bank_account, "bank_ifsc": v.bank_ifsc, "einvoice_required": bool(v.einvoice_required),
+            "tds_section": v.tds_section}
 
 
 def _history(db: Session, invoice: m.Invoice) -> list[dict]:
@@ -109,7 +119,8 @@ def _history(db: Session, invoice: m.Invoice) -> list[dict]:
                     "vendor_tax_id": r.vendor_tax_id, "invoice_number": r.invoice_number,
                     "invoice_date": r.invoice_date.isoformat() if r.invoice_date else None,
                     "grand_total": r.grand_total, "po_reference": r.po_reference, "lines": lines,
-                    "content_fingerprint": r.content_fingerprint, "decision": r.decision})
+                    "content_fingerprint": r.content_fingerprint, "decision": r.decision,
+                    "document_type": r.document_type or "INVOICE"})
     return out
 
 
@@ -189,7 +200,7 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
             {"failed": [c.code for c in fails]}, rn)
         _stage(db, invoice, "MATCHING")
         with LedgerSection(db):
-            return _match_decide_record(db, invoice, run, inv, vres, checks, rules, llm, stage_errors, rn)
+            return _match_decide_record(db, invoice, run, inv, vres, checks, rules, llm, stage_errors, rn, today)
     except DocumentError as e:
         db.rollback()
         invoice = db.get(m.Invoice, invoice_id)
@@ -208,7 +219,8 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
 
 
 def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, inv: ExtractedInvoice, vres: dict,
-                         checks: list, rules: dict, llm: LLMClient, stage_errors: list[str], rn: int) -> m.ProcessingRun:
+                         checks: list, rules: dict, llm: LLMClient, stage_errors: list[str], rn: int,
+                         today: date | None = None) -> m.ProcessingRun:
     """PO matching -> duplicate check -> decision -> ledger -> AI summary. Runs inside LedgerSection,
     so the PO balances and the invoice history it reads cannot change underneath it."""
     # ---------------------------------------------------------------------- PO matching
@@ -224,7 +236,17 @@ def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, 
     if invoice.confirmed_po_id:
         cp = db.get(m.PurchaseOrder, invoice.confirmed_po_id)
         confirmed = snaps.get(cp.po_number) if cp else None
-    match = match_po(inv_match, vendor, vendor_pos, snaps, rules, SemanticScorer(llm), confirmed)
+    kind = document_type(inv)
+    note_info, note_issues = None, []
+    if kind == "INVOICE":
+        invoice.original_invoice_id = None
+        match = match_po(inv_match, vendor, vendor_pos, snaps, rules, SemanticScorer(llm), confirmed)
+    else:
+        # credit / debit notes are processed against the original invoice they cite, not a PO search
+        match, note_info, note_issues = process_note(db, invoice, inv_match, vendor, snaps, rules)
+        log(db, invoice.id, "NOTE_LINKED" if note_info.get("original") else "NOTE_ORIGINAL_MISSING",
+            f"{kind.replace('_', ' ').title()}: {match['explanation']}",
+            {"original": note_info.get("original"), "lines": note_info.get("lines")}, rn)
     if inv_match is not inv:
         match["net_basis"] = inv_match.meta.get("net_conversion")
     run.matching = match
@@ -246,14 +268,27 @@ def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, 
     _stage(db, invoice, "DUPLICATE_CHECK")
 
     # ---------------------------------------------------------------------- duplicates
-    dup = check_duplicates(inv, invoice.file_sha256, vendor["id"] if vendor else None, _history(db, invoice), rules)
+    history = [h for h in _history(db, invoice) if h["document_type"] == kind]
+    dup = check_duplicates(inv, invoice.file_sha256, vendor["id"] if vendor else None, history, rules)
     run.duplicates = dup
     log(db, invoice.id, "DUPLICATE_CHECK_COMPLETED", dup["explanation"],
         {"status": dup["status"], "fingerprint": dup.get("fingerprint")}, rn)
+    _stage(db, invoice, "CONTROLS")
+
+    # ---------------------------------------------------------------------- AP controls
+    controls = run_controls(db, invoice, inv, vendor, match, snaps, rules, today or date.today(), note_info, note_issues)
+    run.controls = controls
+    blocking = [i for i in controls["issues"] if i["outcome"] != "FLAG"]
+    log(db, invoice.id, "CONTROLS_COMPLETED",
+        f"Approval: {controls['approval'].get('message')} "
+        f"E-invoice: {controls['einvoice'].get('status', 'n/a').lower().replace('_', ' ')}. "
+        f"TDS: {controls['tds'].get('message')} "
+        f"{len(blocking)} control finding(s) need review, {len(controls['issues']) - len(blocking)} flag(s).",
+        {"issues": [i["code"] for i in controls["issues"]], "approval_level": controls["approval"].get("level")}, rn)
     _stage(db, invoice, "DECIDING")
 
     # ---------------------------------------------------------------------- decision
-    decision = decide(inv, checks, vres, match, dup, rules, invoice.duplicate_resolution, stage_errors)
+    decision = decide(inv, checks, vres, match, dup, rules, invoice.duplicate_resolution, stage_errors, controls)
     run.decision = decision.model_dump()
     log(db, invoice.id, "DECISION_GENERATED", f"{decision.decision}: {decision.summary}",
         {"decision": decision.decision, "rules": [r.rule for r in decision.reasons]}, rn)
@@ -272,6 +307,14 @@ def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, 
     invoice.grand_total = D(inv.get("grand_total"))
     invoice.po_reference = match["selected_po"] or inv.get("po_number")
     invoice.content_fingerprint = fingerprint(inv)
+    invoice.document_type = kind
+    invoice.approval_level = decision.approval_level
+    invoice.risk_flags = [r["code"] for r in controls["risk"]] or None
+    invoice.bank_account, invoice.bank_ifsc = inv.get("bank_account"), inv.get("bank_ifsc")
+    tds = controls["tds"]
+    invoice.tds_section = tds.get("section") if tds.get("applicable") else None
+    invoice.tds_base = D(tds.get("taxable")) if tds.get("applicable") else None
+    invoice.tds_amount = D(tds.get("amount")) if tds.get("applicable") else None
     invoice.system_decision = decision.decision
 
     # A reviewer's final decision is never silently overwritten by a re-run: the system's new
@@ -320,7 +363,13 @@ def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, 
                                for c in match.get("candidates", []) if c.get("eligible")][:5],
              "duplicate_status": dup["status"],
              "invoice_line_count": len(inv.line_items),
-             "tax_inclusive": bool(inv.meta.get("tax_inclusive"))}
+             "tax_inclusive": bool(inv.meta.get("tax_inclusive")),
+             "document_type": kind,
+             "approval": {k: controls["approval"].get(k) for k in ("level", "limit", "message")},
+             "control_findings": [{"code": i["code"], "outcome": i["outcome"], "message": i["message"]}
+                                  for i in controls["issues"]],
+             "tds": controls["tds"].get("message"),
+             "original_invoice": (note_info or {}).get("original")}
     run.ai_summary = ai_summary(llm, facts)
     if run.ai_summary and run.ai_summary.get("text"):
         log(db, invoice.id, "AI_SUMMARY_GENERATED", "AI summary generated (labelled as AI output).", {}, rn)
@@ -394,13 +443,29 @@ def _check_po_balance(db: Session, invoice: m.Invoice, run: m.ProcessingRun, po:
         raise POBalanceExceeded(f"Approving would over-bill {po.po_number}: {detail}. Amend the PO or reject.", over)
 
 
-def final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str) -> dict:
+def manager_required(db: Session, run: m.ProcessingRun | None) -> bool:
+    """True when this run's invoice was held back by the approval limit and only a manager may approve it now."""
+    level = ((run.decision or {}).get("approval_level") if run else None) or "AUTO"
+    if level == "AUTO":
+        return False
+    return effective_rules(db)["approval"].get("above_limit_approver", "MANAGER") == "MANAGER"
+
+
+def final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str,
+                   role: str = "REVIEWER") -> dict:
     with LedgerSection(db):
-        return _final_decision(db, invoice, decision, reason, user)
+        return _final_decision(db, invoice, decision, reason, user, role)
 
 
-def _final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str) -> dict:
+def _final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str, user: str,
+                    role: str = "REVIEWER") -> dict:
     run = latest_run(db, invoice.id)
+    level = ((run.decision or {}).get("approval_level") if run else None) or "AUTO"
+    # The CURRENT setting decides who may approve an invoice the limit held back (it may have changed since the run).
+    if decision == "APPROVED" and level != "AUTO" and manager_required(db, run) and role != "MANAGER":
+        approval = (run.controls or {}).get("approval") or {}
+        raise ManagerApprovalRequired((approval.get("message") or "This invoice needs manager approval.")
+                                      + " Sign in as a manager to approve it; a reviewer can still reject it.")
     if decision == "APPROVED" and run and run.matching and run.matching.get("selected_po_id"):
         _check_po_balance(db, invoice, run, db.get(m.PurchaseOrder, run.matching["selected_po_id"]))
     before = {"decision": invoice.decision, "decided_by": invoice.decided_by}
@@ -423,7 +488,8 @@ def _final_decision(db: Session, invoice: m.Invoice, decision: str, reason: str,
         if n:
             log(db, invoice.id, "PO_CONSUMPTION_REVERSED", f"Reversed {n} consumption row(s).", {},
                 run.run_no if run else None, user)
-    log(db, invoice.id, "FINAL_DECISION", f"Final decision by {user}: {decision}. Reason: {reason}",
-        {"decision": decision}, run.run_no if run else None, user)
+    log(db, invoice.id, "FINAL_DECISION", f"Final decision by {user}"
+        f"{' (manager)' if role == 'MANAGER' else ''}: {decision}. Reason: {reason}",
+        {"decision": decision, "role": role, "approval_level": level}, run.run_no if run else None, user)
     db.commit()
     return {"decision": decision, "note": note}

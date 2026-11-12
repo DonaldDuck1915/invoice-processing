@@ -7,7 +7,10 @@ extraction is exercised across "vendors". Scans are rasterised, rotated and nois
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
+import json
 import random
 import sys
 from decimal import ROUND_HALF_UP, Decimal
@@ -15,6 +18,9 @@ from pathlib import Path
 
 import pymupdf as fitz
 from PIL import Image, ImageFilter
+from reportlab.graphics import renderPDF
+from reportlab.graphics.barcode.qr import QrCodeWidget
+from reportlab.graphics.shapes import Drawing
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
@@ -67,6 +73,41 @@ def compute(spec):
     return lines, subtotal, discount, shipping, taxable, tax, grand
 
 
+# ----------------------------------------------------------------------------- e-invoice (IRN + signed QR)
+
+DOC_CODE = {"INVOICE": "INV", "CREDIT_NOTE": "CRN", "DEBIT_NOTE": "DBN"}
+
+
+def irn_for(spec, v) -> str:
+    """IRN = SHA-256 over supplier GSTIN, financial year, document type and number (demo values)."""
+    doc = DOC_CODE[spec.get("doc_type", "INVOICE")]
+    return hashlib.sha256(f"{v['tax_id']}2026-27{doc}{spec['number']}".encode()).hexdigest()
+
+
+def _b64json(d) -> str:
+    return base64.urlsafe_b64encode(json.dumps(d, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def einvoice_jwt(spec, v, grand) -> str:
+    """A JWT shaped like the IRP's signed QR. The signature is a dummy - demo documents are not IRP-signed."""
+    d, mth, y = spec["date"].split("/")
+    data = {"SellerGstin": v["tax_id"], "BuyerGstin": COMPANY["gstin"], "DocNo": spec["number"],
+            "DocTyp": DOC_CODE[spec.get("doc_type", "INVOICE")], "DocDt": f"{d}/{mth}/{y}",
+            "TotInvVal": float(spec.get("qr_total", grand)), "ItemCnt": len(spec["lines"]),
+            "MainHsnCode": "8537", "Irn": irn_for(spec, v), "IrnDt": f"{y}-{mth}-{d} 11:02:00"}
+    sig = base64.urlsafe_b64encode(b"demo-signature-not-from-the-IRP").decode().rstrip("=")
+    return ".".join([_b64json({"alg": "RS256", "kid": "demo", "typ": "JWT"}),
+                     _b64json({"data": json.dumps(data, separators=(",", ":")), "iss": "NIC (demo)"}), sig])
+
+
+def draw_qr(c, text: str, x: float, y: float, size: float) -> None:
+    w = QrCodeWidget(text, barLevel="M")
+    x0, y0, x1, y1 = w.getBounds()
+    d = Drawing(size, size, transform=[size / (x1 - x0), 0, 0, size / (y1 - y0), 0, 0])
+    d.add(w)
+    renderPDF.draw(d, c, x, y)
+
+
 # ----------------------------------------------------------------------------- layouts
 
 def layout_classic(c: canvas.Canvas, spec, v):
@@ -74,7 +115,9 @@ def layout_classic(c: canvas.Canvas, spec, v):
     lines, subtotal, discount, shipping, taxable, tax, grand = compute(spec)
     W, H = A4
     c.setFont("Helvetica-Bold", 13)
-    c.drawCentredString(W / 2, H - 40, "TAX INVOICE")
+    c.drawCentredString(W / 2, H - 40, spec.get("title", "TAX INVOICE"))
+    if spec.get("einvoice"):
+        draw_qr(c, einvoice_jwt(spec, v, grand), 455, H - 130, 112)
     c.setFont("Helvetica-Bold", 16)
     c.drawString(40, H - 75, v["name"])
     c.setFont("Helvetica", 9)
@@ -84,9 +127,12 @@ def layout_classic(c: canvas.Canvas, spec, v):
     c.setFont("Helvetica", 10)
     left = ["Bill To:", COMPANY["name"], COMPANY["address"][:48], f"GSTIN: {COMPANY['gstin']}"]
     right = []
+    label = spec.get("number_label", "Invoice")
     if spec.get("number"):
-        right.append(f"Invoice No: {spec['number']}")
-    right += [f"Invoice Date: {spec['date']}"]
+        right.append(f"{label} No: {spec['number']}")
+    right += [f"Invoice Date: {spec['date']}" if label == "Invoice" else f"Date: {spec['date']}"]
+    if spec.get("against"):
+        right.append(f"Against Invoice No: {spec['against']}")
     if spec.get("due"):
         right.append(f"Due Date: {spec['due']}")
     if spec.get("po"):
@@ -145,7 +191,22 @@ def layout_classic(c: canvas.Canvas, spec, v):
     tot(f"Grand Total ({spec['currency']})", grand, bold=True)
     c.setFont("Helvetica-Oblique", 8)
     c.drawString(40, y - 10, "Amount in words: as per figures above. Subject to Pune jurisdiction.")
+    if spec.get("reason"):
+        c.drawString(40, y - 22, f"Reason: {spec['reason']}")
     c.drawString(40, y - 40, f"For {v['name']} - Authorised Signatory")
+    yb = y - 62
+    c.setFont("Helvetica", 9)
+    if spec.get("bank"):
+        acct, ifsc = spec["bank"]
+        c.drawString(40, yb, "Bank details for payment")
+        c.drawString(40, yb - 13, f"A/c No: {acct}")
+        c.drawString(40, yb - 26, f"IFSC: {ifsc}")
+        yb -= 40
+    if spec.get("einvoice"):
+        c.setFont("Helvetica", 7)
+        c.drawString(40, yb, f"IRN: {irn_for(spec, v)}")
+        ack = int(hashlib.sha256(spec["number"].encode()).hexdigest()[:10], 16) % 10**11
+        c.drawString(40, yb - 10, f"Ack No: 1124{ack:011d}  (e-invoice, signed QR code at top right)")
 
 
 def layout_minimal(c: canvas.Canvas, spec, v):
@@ -504,6 +565,57 @@ SCENARIOS = [
      "date": "06/11/2026", "po": "PO-2011", "currency": "INR", "lines": po_lines("PO-2011"), "expect": "APPROVED",
      "story": "Prices include 18% GST (2,950 per stand vs PO 2,500 net). Net values are derived before matching, "
               "so it is not mistaken for an 18% price variance."},
+    # ---- credit / debit notes (upload after 03 and 01)
+    {"file": "24_credit_note_return_5_chairs.pdf", "layout": "classic", "vendor": "V001", "number": "ESS/CN/26-27/007",
+     "title": "CREDIT NOTE", "number_label": "Credit Note", "doc_type": "CREDIT_NOTE", "against": "ESS/26-27/0142",
+     "date": "06/11/2026", "po": "PO-2001", "currency": "INR", "tax_mode": "CGST_SGST",
+     "lines": [("CH-ERG-01", "Ergonomic mesh office chair - returned damaged", "NOS", "5", "5000", "18")],
+     "reason": "5 chairs returned damaged in transit", "expect": "APPROVED",
+     "story": "Credit note for 5 returned chairs against 03: reduces that invoice by 29,500 and gives 5 chairs back to PO-2001."},
+    {"file": "25_debit_note_freight.pdf", "layout": "classic", "vendor": "V004", "number": "TN/DN/26-27/019",
+     "title": "DEBIT NOTE", "number_label": "Debit Note", "doc_type": "DEBIT_NOTE", "against": "TN/26-27/0412",
+     "date": "07/11/2026", "currency": "INR", "tax_mode": "IGST",
+     "lines": [("FRT", "Freight and transit insurance", "LOT", "1", "3500", "18")],
+     "reason": "Freight not included in original invoice", "expect": "MANUAL_REVIEW",
+     "story": "Vendor debit note adding freight to 01: fits PO-2005's value tolerance but needs the buyer's OK."},
+    # ---- approval limits
+    {"file": "26_limit_above_manager.pdf", "layout": "classic", "vendor": "V002", "number": "NOE/26-27/0344",
+     "date": "03/11/2026", "po": "PO-2014", "currency": "INR", "tax_mode": "IGST", "lines": po_lines("PO-2014"),
+     "expect": "MANUAL_REVIEW", "story": "5,52,240 - above the 5,00,000 auto-approval limit; only a manager can approve."},
+    {"file": "27_limit_just_under_a.pdf", "layout": "classic", "vendor": "V002", "number": "NOE/26-27/0350",
+     "date": "04/11/2026", "po": "PO-2015", "currency": "INR", "tax_mode": "IGST",
+     "lines": po_lines("PO-2015", {0: "10"}), "expect": "APPROVED",
+     "story": "4,77,900 - just under the limit: approved, with a 'just under limit' flag."},
+    {"file": "28_limit_just_under_b_split.pdf", "layout": "classic", "vendor": "V002", "number": "NOE/26-27/0418",
+     "date": "10/11/2026", "po": "PO-2015", "currency": "INR", "tax_mode": "IGST",
+     "lines": po_lines("PO-2015", {0: "10"}), "expect": "MANUAL_REVIEW",
+     "story": "Second just-under-limit invoice on the same PO 6 days later - possible split to avoid manager approval."},
+    # ---- fraud signals
+    {"file": "29_fraud_bank_details_changed.pdf", "layout": "classic", "vendor": "V004", "number": "TN/26-27/0466",
+     "date": "08/11/2026", "po": "PO-2016", "currency": "INR", "tax_mode": "IGST", "lines": po_lines("PO-2016"),
+     "bank": ("771100223344", "IDIB000X999"), "expect": "MANUAL_REVIEW",
+     "story": "Asks for payment to a bank account that differs from the vendor master."},
+    {"file": "30_fraud_invoice_before_po.pdf", "layout": "classic", "vendor": "V003", "number": "PWI/0901",
+     "date": "25/08/2026", "po": "PO-103", "currency": "INR", "tax_mode": "CGST_SGST",
+     "lines": [("ACC-KBM-20", "Wireless keyboard and mouse combo", "NOS", "20", "1500", "18")],
+     "bank": ("39012345678", "SBIN0001122"), "expect": "MANUAL_REVIEW",
+     "story": "Invoice dated 25 Aug, before PO-103 was raised (3 Sep) - retro PO. Bank details match the master."},
+    # ---- GST e-invoice (vendor V010 must e-invoice)
+    {"file": "31_einvoice_valid_qr.pdf", "layout": "classic", "vendor": "V010", "number": "KE/26-27/0088",
+     "date": "02/11/2026", "po": "PO-2013", "currency": "INR", "tax_mode": "CGST_SGST", "einvoice": True,
+     "lines": [("EL-PNL-400", "LT distribution panel 400A", "NOS", "1", "85000", "18"),
+               ("EL-CBL-95", "Armoured copper cable 95 sq mm", "MTR", "100", "950", "18")],
+     "bank": ("00451100012345", "BARB0CHAKAN"), "expect": "APPROVED",
+     "story": "Valid e-invoice: IRN and signed QR match the printed invoice. TDS 194C 2% withheld."},
+    {"file": "32_einvoice_missing_irn.pdf", "layout": "classic", "vendor": "V010", "number": "KE/26-27/0091",
+     "date": "05/11/2026", "po": "PO-2013", "currency": "INR", "tax_mode": "CGST_SGST",
+     "lines": [("EL-PNL-400", "LT distribution panel 400A", "NOS", "1", "85000", "18")], "expect": "MANUAL_REVIEW",
+     "story": "Vendor must e-invoice but sent a plain invoice - no IRN, no QR."},
+    {"file": "33_einvoice_qr_mismatch.pdf", "layout": "classic", "vendor": "V010", "number": "KE/26-27/0095",
+     "date": "07/11/2026", "po": "PO-2013", "currency": "INR", "tax_mode": "CGST_SGST", "einvoice": True,
+     "qr_total": "112100.00",
+     "lines": [("EL-CBL-95", "Armoured copper cable 95 sq mm", "MTR", "200", "950", "18")], "expect": "MANUAL_REVIEW",
+     "story": "Printed total 2,24,200 but the signed QR says 1,12,100 - the PDF was altered after the IRN was issued."},
 ]
 
 

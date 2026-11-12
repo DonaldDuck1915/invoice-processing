@@ -51,11 +51,14 @@ export default function Invoices() {
                   <td className="td text-slate-400">{i.id}</td>
                   <td className="td"><Link to={`/invoices/${i.id}`} className="font-medium text-slate-800 hover:text-indigo-700">{i.vendor_name || "—"}</Link>
                     <div className="text-xs text-slate-400 truncate max-w-[260px]">{i.filename}</div></td>
-                  <td className="td">{i.invoice_number || <span className="text-slate-400">missing</span>}{i.is_scanned && <Pill className="ml-2 bg-slate-100 text-slate-500 ring-slate-400/20">scan</Pill>}</td>
+                  <td className="td">{i.invoice_number || <span className="text-slate-400">missing</span>}{i.is_scanned && <Pill className="ml-2 bg-slate-100 text-slate-500 ring-slate-400/20">scan</Pill>}
+                    {i.document_type && i.document_type !== "INVOICE" && <Pill className="ml-2 bg-emerald-50 text-emerald-700 ring-emerald-600/20">{i.document_type === "CREDIT_NOTE" ? "credit note" : "debit note"}</Pill>}</td>
                   <td className="td whitespace-nowrap">{dateOnly(i.invoice_date)}</td>
                   <td className="td">{i.po_number || <span className="text-slate-400">—</span>}</td>
                   <td className="td num">{money(i.grand_total, i.currency)}</td>
-                  <td className="td">{i.status === "PROCESSED" ? <DecisionBadge decision={i.decision} by={i.decided_by} /> : <Pill className="bg-slate-100 text-slate-600 ring-slate-400/20">{i.status.toLowerCase()}</Pill>}</td>
+                  <td className="td">{i.status === "PROCESSED" ? <DecisionBadge decision={i.decision} by={i.decided_by} /> : <Pill className="bg-slate-100 text-slate-600 ring-slate-400/20">{i.status.toLowerCase()}</Pill>}
+                    {i.approval_level === "MANAGER" && i.decision === "MANUAL_REVIEW" && <Pill className="ml-1 bg-violet-100 text-violet-700 ring-violet-600/20">manager</Pill>}
+                    {i.risk_flags?.length > 0 && <Pill className="ml-1 bg-rose-50 text-rose-700 ring-rose-600/20" >{i.risk_flags.length} risk</Pill>}</td>
                   <td className="td text-xs text-slate-500 whitespace-nowrap">{dateTime(i.created_at)}</td>
                 </tr>
               ))}

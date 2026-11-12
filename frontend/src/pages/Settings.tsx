@@ -1,7 +1,8 @@
-import { Download, FileSpreadsheet, Mail } from "lucide-react";
+import { Download, FileSpreadsheet, Lock, Mail, Plus, Trash2, UserCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { Card, ErrorBox, Note, Spinner } from "../components/ui";
+import { money } from "../format";
 
 const NUMERIC: [string, string, string][] = [
   ["tolerances", "quantity_pct", "Quantity tolerance (%)"],
@@ -45,10 +46,12 @@ export default function Settings() {
   const [replace, setReplace] = useState(false);
   const [csv, setCsv] = useState<File | null>(null);
   const [email, setEmail] = useState<any>(null);
+  const [me, setMe] = useState<any>(null);
+  const [newCur, setNewCur] = useState("");
   const csvInput = useRef<HTMLInputElement>(null);
 
   const load = () => api.get("/config/rules").then((r) => { setRules(r); setDraft(structuredClone(r.effective)); }).catch(setError);
-  useEffect(() => { load(); api.get("/admin/email").then(setEmail).catch(() => setEmail({ enabled: false })); }, []);
+  useEffect(() => { load(); api.get("/auth/me").then(setMe).catch(() => {}); api.get("/admin/email").then(setEmail).catch(() => setEmail({ enabled: false })); }, []);
   if (!draft) return error ? <ErrorBox error={error} /> : <Spinner label="Loading rules..." />;
 
   function diff(base: any, cur: any): any {
@@ -64,7 +67,32 @@ export default function Settings() {
     setError(null); setMsg(null);
     try { await api.put("/config/rules", { overrides: diff(rules.defaults, draft) }); await load(); setMsg("Rules saved. New runs use them; past runs keep the snapshot they used."); } catch (e) { setError(e); }
   }
-  async function reset() { setDraft(structuredClone(rules.defaults)); }
+  async function reset() {
+    // "Defaults" resets tolerances and policies; approval limits stay as they are unless a manager resets them
+    const d = structuredClone(rules.defaults);
+    if (me?.role !== "MANAGER") {
+      d.approval = structuredClone(draft.approval);
+      for (const k of ["above_approval_limit", "near_limit", "split_below_limit"]) d.policy[k] = draft.policy[k];
+    }
+    setDraft(d);
+  }
+  const isManager = me?.role === "MANAGER";
+  const setApproval = (patch: any) => setDraft({ ...draft, approval: { ...draft.approval, ...patch } });
+  const setLimit = (cur: string, v: string) => setApproval({ auto_approve_limit: { ...draft.approval.auto_approve_limit, [cur]: v === "" ? 0 : Number(v) } });
+  const limits: Record<string, number | null> = draft.approval.auto_approve_limit;
+  const limitCurrencies = Object.keys(limits).filter((c) => limits[c] !== null).sort();
+  const removedCurrencies = Object.keys(limits).filter((c) => limits[c] === null);
+  function addCurrency() {
+    if (newCur.length !== 3 || limitCurrencies.includes(newCur)) return;
+    setLimit(newCur, "0");
+    setNewCur("");
+  }
+  function removeCurrency(cur: string) {
+    // a default currency is switched off with null (overrides are merged onto the defaults); an added one is dropped
+    const next = { ...limits };
+    if (rules.defaults.approval.auto_approve_limit[cur] != null) next[cur] = null; else delete next[cur];
+    setApproval({ auto_approve_limit: next });
+  }
   async function doImport() {
     setError(null); setMsg(null);
     try { const body = JSON.parse(json); const r = await api.post("/admin/import", { ...body, replace }); setMsg(`Imported ${r.vendors_added} vendor(s) and ${r.purchase_orders_added} PO(s).`); }
@@ -104,6 +132,67 @@ export default function Settings() {
       </div>
       {msg && <Note>{msg}</Note>}
       <ErrorBox error={error} />
+      <Card title={<span className="flex items-center gap-2"><UserCheck className="h-4 w-4 text-violet-600" />Approval limits</span>}
+        subtitle={`Invoices up to the limit (gross, in the invoice currency) can be approved automatically. Above it - or in a currency with no limit - the invoice goes to review, and ${draft.approval.above_limit_approver === "MANAGER" ? "only a manager" : "a reviewer or manager"} can approve it. Credit notes are exempt.`}
+        actions={isManager ? <button className="btn-primary" onClick={save}>Save limits</button> : <span className="inline-flex items-center gap-1 text-xs text-slate-500"><Lock className="h-3.5 w-3.5" />Manager only</span>}>
+        <div className="mb-5 max-w-md"><label className="label">Who can approve an invoice above the limit (or with no limit for its currency)</label>
+          <select className="input" disabled={!isManager} value={draft.approval.above_limit_approver ?? "MANAGER"} onChange={(e) => setApproval({ above_limit_approver: e.target.value })}>
+            <option value="REVIEWER">Reviewer or manager</option><option value="MANAGER">Manager only</option>
+          </select>
+          <div className="mt-1 text-[11px] text-slate-400">It is never approved automatically either way. Applies to invoices already waiting in review too.</div></div>
+        <h4 className="mb-2 text-xs font-semibold uppercase text-slate-500">Limit per currency</h4>
+        <p className="mb-3 text-xs text-slate-500">The invoice's currency picks the limit. Adding a currency here also lets invoices and POs use it. An invoice in a currency with no limit is never approved automatically.</p>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {limitCurrencies.map((cur) => {
+            const def = rules.defaults.approval.auto_approve_limit[cur];
+            return (
+              <div key={cur}>
+                <div className="flex items-center justify-between"><label className="label">Auto-approval limit ({cur})</label>
+                  {isManager && <button type="button" className="mb-1 text-slate-400 hover:text-rose-600" title={`Remove the ${cur} limit`} onClick={() => removeCurrency(cur)}><Trash2 className="h-3.5 w-3.5" /></button>}
+                </div>
+                <input className="input" type="number" min="0" step="1" disabled={!isManager} value={draft.approval.auto_approve_limit[cur]}
+                  onChange={(e) => setLimit(cur, e.target.value)} />
+                <div className="mt-1 text-[11px] text-slate-400">{money(draft.approval.auto_approve_limit[cur], cur)}{def != null && def !== draft.approval.auto_approve_limit[cur] ? ` · default ${money(def, cur)}` : def == null ? " · added currency" : ""}</div>
+              </div>
+            );
+          })}
+          {isManager && (
+            <div>
+              <label className="label">Add a currency</label>
+              <div className="flex gap-2">
+                <input className="input uppercase" maxLength={3} placeholder="e.g. GBP" value={newCur}
+                  onChange={(e) => setNewCur(e.target.value.toUpperCase().replace(/[^A-Z]/g, ""))}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCurrency(); } }} />
+                <button type="button" className="btn-secondary shrink-0" disabled={newCur.length !== 3 || limitCurrencies.includes(newCur)} onClick={addCurrency}><Plus className="h-4 w-4" />Add</button>
+              </div>
+              <div className="mt-1 text-[11px] text-slate-400">{newCur.length === 3 && limitCurrencies.includes(newCur) ? `${newCur} already has a limit` : "3-letter ISO code, then set its limit and save"}</div>
+            </div>
+          )}
+        </div>
+        {removedCurrencies.length > 0 && <p className="mt-2 text-xs text-amber-700">No limit for {removedCurrencies.join(", ")} - invoices in {removedCurrencies.length > 1 ? "these currencies" : "this currency"} will always need a person's approval.</p>}
+        <h4 className="mt-6 mb-3 text-xs font-semibold uppercase text-slate-500">Near-limit and split detection</h4>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div><label className="label">"Just under the limit" band (%)</label>
+            <input className="input" type="number" min="0" max="100" step="any" disabled={!isManager} value={draft.approval.near_limit_pct}
+              onChange={(e) => setApproval({ near_limit_pct: e.target.value === "" ? 0 : Number(e.target.value) })} />
+            <div className="mt-1 text-[11px] text-slate-400">Invoices this close below the limit are flagged</div></div>
+          <div><label className="label">Split-invoice look-back (days)</label>
+            <input className="input" type="number" min="0" step="1" disabled={!isManager} value={draft.approval.split_window_days}
+              onChange={(e) => setApproval({ split_window_days: e.target.value === "" ? 0 : Number(e.target.value) })} />
+            <div className="mt-1 text-[11px] text-slate-400">Several just-under invoices from one vendor in this window</div></div>
+          <div><label className="label">Just-under-limit invoice</label>
+            <select className="input" disabled={!isManager} value={draft.policy.near_limit} onChange={(e) => setDraft({ ...draft, policy: { ...draft.policy, near_limit: e.target.value } })}>
+              <option value="FLAG">flag only</option><option value="MANUAL_REVIEW">manual review</option>
+            </select></div>
+          <div><label className="label">Possible split below the limit</label>
+            <select className="input" disabled={!isManager} value={draft.policy.split_below_limit} onChange={(e) => setDraft({ ...draft, policy: { ...draft.policy, split_below_limit: e.target.value } })}>
+              <option value="MANUAL_REVIEW">manual review</option><option value="REJECT">reject</option>
+            </select></div>
+        </div>
+        {!isManager && <p className="mt-3 text-xs text-slate-500">Sign in as a manager to change the approval limits - a reviewer cannot raise their own limit. Every change is written to the audit log.</p>}
+        {isManager && <p className="mt-3 text-xs text-slate-500">New uploads use the new limits. Invoices already processed keep their result until you re-run them.</p>}
+      </Card>
+
       <Card title="Tolerances & thresholds" actions={<div className="flex gap-2"><button className="btn-secondary" onClick={reset}>Defaults</button><button className="btn-primary" onClick={save}>Save rules</button></div>}>
         <div className="grid sm:grid-cols-2 gap-4">
           {NUMERIC.map(([g, k, label]) => (

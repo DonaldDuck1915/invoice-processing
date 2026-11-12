@@ -76,3 +76,24 @@ def test_import_procurement(db):
     assert r.json() == {"vendors_added": 1, "purchase_orders_added": 1}
     po = c.get("/api/v1/purchase-orders/PO-9001", headers=h).json()
     assert po["subtotal"] == "55.00" and po["total_amount"] == "65.45"
+
+
+def test_profile_name_designation_and_photo(db):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    c = TestClient(app)
+    tok = c.post("/api/v1/auth/login", json={"username": "reviewer", "password": "review123"}).json()["token"]
+    h = {"Authorization": "Bearer " + tok}
+    me = c.get("/api/v1/auth/me", headers=h).json()
+    assert me["designation"] == "Accounts Payable" and me["avatar"] is None
+    r = c.patch("/api/v1/auth/me", headers=h, json={"name": "Priya Sharma", "designation": "Senior AP Analyst",
+                                                    "avatar": "data:image/png;base64,iVBORw0KGgo="})
+    assert r.status_code == 200 and r.json()["name"] == "Priya Sharma"
+    me = c.get("/api/v1/auth/me", headers=h).json()
+    assert (me["name"], me["designation"], me["avatar"][:15]) == ("Priya Sharma", "Senior AP Analyst", "data:image/png;")
+    assert c.patch("/api/v1/auth/me", headers=h, json={"name": "  "}).status_code == 422
+    assert c.patch("/api/v1/auth/me", headers=h, json={"avatar": "javascript:alert(1)"}).status_code == 422
+    assert c.patch("/api/v1/auth/me", json={"name": "x"}).status_code == 401
+    c.patch("/api/v1/auth/me", headers=h, json={"avatar": ""})
+    assert c.get("/api/v1/auth/me", headers=h).json()["avatar"] is None

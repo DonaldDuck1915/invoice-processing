@@ -1,4 +1,4 @@
-"""AI extractor (Gemini or Claude). Every value must come with a verbatim source quote, which is
+"""AI extractor (OpenAI). Every value must come with a verbatim source quote, which is
 verified against the document's own text before the value is trusted."""
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ _NULLABLE = {"anyOf": [{"type": "string"}, {"type": "null"}]}
 _FIELD = {"type": "object", "properties": {"value": _NULLABLE, "source_quote": _NULLABLE},
           "required": ["value", "source_quote"], "additionalProperties": False}
 _HEADER = ["vendor_name", "vendor_tax_id", "vendor_address", "invoice_number", "invoice_date", "due_date",
-           "po_number", "currency", "subtotal", "taxable_amount", "tax_amount", "discount", "shipping", "grand_total"]
+           "po_number", "currency", "subtotal", "taxable_amount", "tax_amount", "discount", "shipping", "grand_total",
+           "document_type", "original_invoice_number", "bank_account", "bank_ifsc", "irn"]
 _LINE = {"type": "object", "properties": {k: _NULLABLE for k in
                                           ["description", "item_code", "quantity", "uom", "unit_price", "tax_rate",
                                            "line_total", "source_quote"]},
@@ -47,6 +48,10 @@ Rules:
 - discount and shipping: positive numbers if printed, else null.
 - tax_amount: the total tax only if a total-tax figure is printed; list each printed tax line (CGST, SGST, IGST, VAT, SALES_TAX) in tax_components.
 - Line items: one entry per printed row, in order. If a row has no quantity or unit price, leave those null.
+- document_type: INVOICE, CREDIT_NOTE or DEBIT_NOTE, from the document's title. For a credit or debit note, invoice_number is the NOTE's own number and original_invoice_number is the invoice it refers to ("against invoice no."); null for an ordinary invoice.
+- Amounts on a credit note: return them as positive numbers.
+- bank_account: the vendor's bank account number or IBAN printed for payment (no spaces); bank_ifsc: the IFSC, SWIFT/BIC or routing code printed next to it.
+- irn: the 64-character e-invoice IRN (Invoice Reference Number) if printed, else null.
 - source_quote: copy a short verbatim snippet (max ~80 characters) from the document that contains the value, so it can be verified. For a line item, quote the row's description text.
 - notes: one or two sentences on anything unusual (e.g. a field that is unreadable, handwritten corrections). Empty string if nothing."""
 

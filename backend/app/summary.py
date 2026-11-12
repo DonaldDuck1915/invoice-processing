@@ -66,7 +66,10 @@ by deterministic business rules (decision, reasons, checks, PO candidates, varia
      polite e-mail body to the vendor quoting the invoice number and the specific issue; else null."""
 
 
-def _guard(rec: dict | None, decision: str, candidates: list[str]) -> dict | None:
+HIGH_RISK = {"BANK_DETAILS_CHANGED", "EINVOICE_MISMATCH", "SPLIT_BELOW_LIMIT"}
+
+
+def _guard(rec: dict | None, decision: str, candidates: list[str], facts: dict | None = None) -> dict | None:
     """Enforce the rules the prompt asks for - the model's output is never trusted blindly."""
     if not rec or decision == "APPROVED" or rec.get("action") not in ACTIONS:
         return None
@@ -75,6 +78,13 @@ def _guard(rec: dict | None, decision: str, candidates: list[str]) -> dict | Non
     if decision == "REJECTED" and rec["action"] == "APPROVE":
         rec["action"] = "ESCALATE"
         warnings.append("The AI suggested approving a rejected invoice; changed to escalate.")
+    risky = {f.get("code") for f in (facts or {}).get("control_findings") or []} & HIGH_RISK
+    if rec["action"] == "APPROVE" and risky:
+        rec["action"] = "ESCALATE"
+        warnings.append(f"The AI suggested approving despite {', '.join(sorted(risky)).lower().replace('_', ' ')}; "
+                        "changed to escalate.")
+    if rec["action"] == "APPROVE" and ((facts or {}).get("approval") or {}).get("level") == "MANAGER":
+        warnings.append("Above the auto-approval limit: only a manager can approve.")
     po = (rec.get("suggested_po") or "").strip().upper() or None
     if po and po not in candidates:
         warnings.append(f"The AI suggested {po}, which is not one of this vendor's candidate POs; ignored.")
@@ -102,5 +112,5 @@ def ai_summary(llm: LLMClient, facts: dict) -> dict | None:
                 "disclaimer": AI_DISCLAIMER}
     candidates = [c["po_number"] for c in facts.get("po_candidates") or []]
     return {"text": (data.get("summary") or "").strip() or None, "label": "AI summary", "disclaimer": AI_DISCLAIMER,
-            "recommendation": _guard(data.get("recommendation"), facts.get("decision"), candidates),
+            "recommendation": _guard(data.get("recommendation"), facts.get("decision"), candidates, facts),
             "model": llm.model_for("decision_summary"), "provider": llm.provider}

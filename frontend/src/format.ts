@@ -30,12 +30,13 @@ function group(int: string, currency?: string | null) {
   return int.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-const SYMBOL: Record<string, string> = { INR: "₹", EUR: "€", USD: "$" };
+const SYMBOL: Record<string, string> = { INR: "₹", EUR: "€", USD: "$", GBP: "£" };
 
 export function money(v: string | number | null | undefined, currency?: string | null): string {
   if (v === null || v === undefined || v === "") return "—";
   const [int, frac, neg] = roundStr(String(v));
-  return `${neg ? "-" : ""}${SYMBOL[currency || ""] ?? ""}${group(int, currency)}.${frac}`;
+  const sym = currency ? SYMBOL[currency] ?? `${currency} ` : "";   // other currencies show their code, e.g. "AED 1,200.00"
+  return `${neg ? "-" : ""}${sym}${group(int, currency)}.${frac}`;
 }
 
 export function num(v: string | number | null | undefined): string {
@@ -71,5 +72,7 @@ export const FIELD_LABELS: Record<string, string> = {
   invoice_number: "Invoice number", invoice_date: "Invoice date", due_date: "Due date", po_number: "PO reference",
   currency: "Currency", subtotal: "Subtotal", taxable_amount: "Taxable amount", tax_amount: "Tax amount",
   discount: "Discount", shipping: "Shipping / freight", grand_total: "Grand total",
+  document_type: "Document type (invoice / credit note / debit note)", original_invoice_number: "Original invoice (for a note)",
+  bank_account: "Bank account / IBAN", bank_ifsc: "IFSC / SWIFT", irn: "E-invoice IRN",
 };
 export const MONEY_FIELDS = new Set(["subtotal", "taxable_amount", "tax_amount", "discount", "shipping", "grand_total"]);

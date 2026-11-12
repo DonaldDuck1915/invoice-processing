@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from .extraction.parsers import classify_tax_id, gstin_is_valid
-from .money import D, SUPPORTED_CURRENCIES, ZERO, q2, s
+from .money import D, ZERO, q2, s, supported_currencies
 from .schemas import CheckResult, ExtractedInvoice
 from .tax_mode import included_tax
 
@@ -303,14 +303,17 @@ def check_confidence(inv: ExtractedInvoice, rules: dict) -> list[CheckResult]:
     return out
 
 
-def check_currency(inv: ExtractedInvoice) -> CheckResult:
+def check_currency(inv: ExtractedInvoice, rules: dict | None = None) -> CheckResult:
     f = inv.field("currency")
     if f.value is None:
         return CheckResult(code="V9.currency", name="Currency identified", status="WARN", category="MISSING",
                            severity="INFO", message="No currency printed; the PO/vendor currency will be assumed (flagged).")
-    if f.value not in SUPPORTED_CURRENCIES:
+    supported = supported_currencies(rules)
+    if f.value not in supported:
         return CheckResult(code="V9.currency", name="Currency identified", status="FAIL", category="INCORRECT",
-                           severity="REVIEW", message=f"Currency {f.value} is not supported (INR, EUR, USD).")
+                           severity="REVIEW",
+                           message=f"Currency {f.value} is not set up (set up: {', '.join(sorted(supported))}). "
+                                   "A manager can add it with an approval limit on the Rules & data page.")
     return CheckResult(code="V9.currency", name="Currency identified", status="PASS", message=f"Currency {f.value}.")
 
 
@@ -324,5 +327,5 @@ def run_validation(inv: ExtractedInvoice, vendor_res: dict, rules: dict, today: 
     results += check_dates(inv, rules, today)
     results += check_vendor(inv, vendor_res, rules)
     results += check_confidence(inv, rules)
-    results.append(check_currency(inv))
+    results.append(check_currency(inv, rules))
     return results

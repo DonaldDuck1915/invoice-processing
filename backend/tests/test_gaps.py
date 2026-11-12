@@ -198,25 +198,25 @@ def test_reprocess_runs_in_background_and_timestamps_carry_utc(db):
 
 
 def test_ai_timeout_is_not_waited_for_twice_in_one_run():
-    class SlowGemini(LLMClient):
+    class SlowAI(LLMClient):
         tries = 0
         available = True
-        provider = "gemini"
+        provider = "openai"
 
-        def _call_gemini(self, system, blocks, schema, max_tokens, entry, effort="medium"):
-            SlowGemini.tries += 1
+        def _call_openai(self, system, blocks, schema, max_tokens, entry, effort="medium"):
+            SlowAI.tries += 1
             entry["error"] = "API error 504"
-            raise LLMUnavailable("Gemini service error (504)")
+            raise LLMUnavailable("OpenAI service error (504)")
 
-    llm = SlowGemini()
-    llm.settings = llm.settings.model_copy(update={"gemini_model": "main", "gemini_fast_model": "fast",
-                                                   "gemini_fallback_model": None})
+    llm = SlowAI()
+    llm.settings = llm.settings.model_copy(update={"openai_model": "main", "openai_fast_model": "fast",
+                                                   "openai_fallback_model": None})
     for purpose in ("extraction", "decision_summary"):
         with pytest.raises(LLMUnavailable):
             llm.json_call(purpose, "sys", [{"type": "text", "text": purpose}], {"type": "object"})
     # extraction tried "main" then fell back to "fast"; both are now known to be down, so the
     # summary call waits for neither
-    assert SlowGemini.tries == 2
+    assert SlowAI.tries == 2
     assert [c["model"] for c in llm.calls] == ["main", "fast", "fast", "main"]
     assert all("skipped" in c["error"] for c in llm.calls[2:])
 
@@ -224,17 +224,17 @@ def test_ai_timeout_is_not_waited_for_twice_in_one_run():
 def test_overloaded_model_falls_back_to_the_other_one():
     class BusyMain(LLMClient):
         available = True
-        provider = "gemini"
+        provider = "openai"
 
-        def _call_gemini(self, system, blocks, schema, max_tokens, entry, effort="medium"):
+        def _call_openai(self, system, blocks, schema, max_tokens, entry, effort="medium"):
             if entry["model"] == "main":
                 entry["error"] = "API error 503"
-                raise LLMUnavailable("Gemini service error (503): high demand")
+                raise LLMUnavailable("OpenAI service error (503)")
             return '{"ok": "yes"}'
 
     llm = BusyMain()
-    llm.settings = llm.settings.model_copy(update={"gemini_model": "main", "gemini_fast_model": "fast",
-                                                   "gemini_fallback_model": None})
+    llm.settings = llm.settings.model_copy(update={"openai_model": "main", "openai_fast_model": "fast",
+                                                   "openai_fallback_model": None})
     assert llm.json_call("extraction", "s", [{"type": "text", "text": "x"}], {"type": "object"}) == {"ok": "yes"}
     assert [(c["model"], c["ok"]) for c in llm.calls] == [("main", False), ("fast", True)]
 
@@ -242,13 +242,13 @@ def test_overloaded_model_falls_back_to_the_other_one():
 def test_bad_key_is_not_retried_on_another_model():
     class BadKey(LLMClient):
         available = True
-        provider = "gemini"
+        provider = "openai"
         tries = 0
 
-        def _call_gemini(self, system, blocks, schema, max_tokens, entry, effort="medium"):
+        def _call_openai(self, system, blocks, schema, max_tokens, entry, effort="medium"):
             BadKey.tries += 1
             entry["error"] = "API error 403"
-            raise LLMUnavailable("Gemini rejected the API key - check GEMINI_API_KEY.")
+            raise LLMUnavailable("OpenAI rejected the API key - check OPENAI_API_KEY.")
 
     llm = BadKey()
     with pytest.raises(LLMUnavailable, match="API key"):
@@ -398,7 +398,7 @@ def test_health_reports_demo_defaults(db):
 class AdvisorLLM(LLMClient):
     """Returns a fixed summary + recommendation so the guardrails can be tested."""
     available = True
-    provider = "gemini"
+    provider = "openai"
 
     def __init__(self, rec):
         super().__init__()

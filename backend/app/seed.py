@@ -17,7 +17,7 @@ class ImportError_(ValueError):
     pass
 
 
-def _po_from_dict(db: Session, data: dict, vendor_by_code: dict[str, m.Vendor]) -> m.PurchaseOrder:
+def po_from_dict(db: Session, data: dict, vendor_by_code: dict[str, m.Vendor]) -> m.PurchaseOrder:
     vendor = vendor_by_code.get(data["vendor"])
     if vendor is None:
         raise ImportError_(f"PO {data.get('po_number')}: unknown vendor code {data.get('vendor')!r}")
@@ -65,7 +65,9 @@ def import_procurement(db: Session, payload: dict, replace: bool = False) -> dic
         vendor = m.Vendor(code=v["code"], name=v["name"], tax_id=tax_id, tax_id_type=classify_tax_id(tax_id),
                           country=v.get("country", "IN"), address=v.get("address"),
                           status=v.get("status", "APPROVED").upper(),
-                          default_currency=v.get("default_currency", "INR").upper())
+                          default_currency=v.get("default_currency", "INR").upper(),
+                          bank_account=v.get("bank_account"), bank_ifsc=v.get("bank_ifsc"),
+                          einvoice_required=bool(v.get("einvoice_required", False)), tds_section=v.get("tds_section"))
         db.add(vendor)
         vendor_by_code[v["code"]] = vendor
         added_v += 1
@@ -73,7 +75,7 @@ def import_procurement(db: Session, payload: dict, replace: bool = False) -> dic
     for p in payload.get("purchase_orders", []):
         if p["po_number"].strip().upper() in existing_pos:
             continue
-        _po_from_dict(db, p, vendor_by_code)
+        po_from_dict(db, p, vendor_by_code)
         added_p += 1
     db.commit()
     return {"vendors_added": added_v, "purchase_orders_added": added_p}
@@ -83,7 +85,7 @@ def seed_demo(db: Session, reset: bool = False) -> dict:
     if reset:
         reset_all(db)
     if db.scalar(select(m.Vendor.id).limit(1)) is not None:
-        return {"seeded": False}
+        return {"seeded": False, **top_up_demo(db)}
     result = import_procurement(db, {"vendors": VENDORS, "purchase_orders": PURCHASE_ORDERS})
     for h in HISTORICAL_INVOICES:
         vendor = db.scalar(select(m.Vendor).where(m.Vendor.code == h["vendor"]))
@@ -109,3 +111,21 @@ def seed_demo(db: Session, reset: bool = False) -> dict:
                             message="Historical approved invoice seeded so PO consumption history exists.", payload={}))
     db.commit()
     return {"seeded": True, **result}
+
+
+def top_up_demo(db: Session) -> dict:
+    """Bring a database seeded by an older version up to date: add demo vendors / POs that are missing and
+    fill demo vendors' payment and compliance fields that are still empty. Never overwrites a value."""
+    result = import_procurement(db, {"vendors": VENDORS, "purchase_orders": PURCHASE_ORDERS})
+    filled = 0
+    by_code = {v.code: v for v in db.scalars(select(m.Vendor))}
+    for spec in VENDORS:
+        v = by_code.get(spec["code"])
+        if v is None or normalize_tax_id(spec.get("tax_id")) != v.tax_id:
+            continue  # not the demo vendor any more
+        for key in ("bank_account", "bank_ifsc", "tds_section"):
+            if spec.get(key) and getattr(v, key) is None:
+                setattr(v, key, spec[key])
+                filled += 1
+    db.commit()
+    return {**result, "vendor_fields_filled": filled}

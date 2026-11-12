@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import threading
 import time
@@ -27,10 +28,13 @@ from ..ingestion import ingest
 from ..jobs import process_many
 from ..ledger import consumption_by_line, po_snapshot
 from ..llm import AI_DISCLAIMER
-from ..pipeline import (POBalanceExceeded, confirm_po, correct_fields, effective_rules, final_decision, latest_run,
+from ..notes import adjustments
+from ..pipeline import (ManagerApprovalRequired, POBalanceExceeded, confirm_po, manager_required, correct_fields, effective_rules, final_decision, latest_run,
                         resolve_duplicate)
-from ..seed import import_procurement, seed_demo
-from .auth import check_credentials, current_user, issue_token
+from ..audit import log as audit_log
+from ..money import supported_currencies
+from ..seed import import_procurement, po_from_dict, seed_demo
+from .auth import check_credentials, current_user, issue_token, user_info, user_role
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
@@ -86,7 +90,7 @@ def _throttle(client: str) -> None:
 
 
 @router.post("/auth/login")
-def login(body: LoginBody, request: Request):
+def login(body: LoginBody, request: Request, db: Session = Depends(get_db)):
     client = request.client.host if request.client else "unknown"
     _throttle(client)
     if not check_credentials(body.username, body.password):
@@ -95,13 +99,42 @@ def login(body: LoginBody, request: Request):
         err(401, "INVALID_CREDENTIALS", "Incorrect username or password.")
     with _login_lock:
         _failed_logins.pop(client, None)
-    s = get_settings()
-    return {"token": issue_token(body.username), "user": {"username": body.username, "name": s.reviewer_display_name}}
+    return {"token": issue_token(body.username), "user": user_info(body.username, db.get(m.UserProfile, body.username))}
 
 
 @router.get("/auth/me")
-def me(user: str = Depends(current_user)):
-    return {"username": user, "name": get_settings().reviewer_display_name}
+def me(db: Session = Depends(get_db), user: str = Depends(current_user)):
+    return user_info(user, db.get(m.UserProfile, user))
+
+
+class ProfileBody(BaseModel):
+    name: str | None = Field(None, max_length=80)
+    designation: str | None = Field(None, max_length=80)
+    avatar: str | None = Field(None, max_length=400_000)   # data URL; "" removes the photo
+
+
+@router.patch("/auth/me")
+def update_me(body: ProfileBody, db: Session = Depends(get_db), user: str = Depends(current_user)):
+    """Change the display name, designation and photo shown in the sidebar (the account itself is unchanged)."""
+    prof = db.get(m.UserProfile, user) or m.UserProfile(username=user)
+    data = body.model_dump(exclude_unset=True)
+    if "name" in data:
+        name = (data["name"] or "").strip()
+        if not name:
+            err(422, "INVALID_PROFILE", "Name cannot be empty.")
+        prof.display_name = name
+    if "designation" in data:
+        prof.designation = (data["designation"] or "").strip() or None
+    if "avatar" in data:
+        av = data["avatar"] or None
+        if av and not av.startswith(("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,")):
+            err(422, "INVALID_PROFILE", "The photo must be a PNG, JPEG or WebP image.")
+        prof.avatar = av
+    db.add(prof)
+    audit_log(db, None, "PROFILE_UPDATED", f"{user} updated their profile ({', '.join(data) or 'nothing'}).",
+              {"fields": list(data)}, None, user)
+    db.commit()
+    return user_info(user, prof)
 
 
 @router.get("/health")
@@ -110,7 +143,7 @@ def health(db: Session = Depends(get_db)):
     db.execute(select(1))
     return {"ok": True, "ocr_available": ocr_available(s.tesseract_cmd), "ai_configured": s.llm_available,
             "ai_model": s.ai_model, "ai_provider": s.ai_provider,
-            "ai_fast_model": (s.gemini_fast_model or s.gemini_model) if s.ai_provider == "gemini" else s.ai_model,
+            "ai_fast_model": (s.openai_fast_model or s.openai_model) if s.ai_provider else None,
             "database": "postgresql" if s.database_url.startswith("postgresql") else "sqlite",
             "email_intake": bool(s.imap_host), "insecure_defaults": s.insecure_defaults}
 
@@ -133,6 +166,9 @@ def _invoice_summary(inv: m.Invoice) -> dict:
             "invoice_number": inv.invoice_number, "invoice_date": inv.invoice_date, "currency": inv.currency,
             "grand_total": inv.grand_total, "po_number": inv.po.po_number if inv.po else inv.po_reference,
             "is_scanned": inv.is_scanned, "page_count": inv.page_count, "created_at": inv.created_at,
+            "document_type": inv.document_type or "INVOICE", "original_invoice_id": inv.original_invoice_id,
+            "approval_level": inv.approval_level, "risk_flags": inv.risk_flags or [],
+            "tds_section": inv.tds_section, "tds_amount": inv.tds_amount,
             "updated_at": inv.updated_at}
 
 
@@ -196,6 +232,20 @@ def _get_invoice(db: Session, invoice_id: int) -> m.Invoice:
     return inv
 
 
+def ai_usage(runs) -> dict:
+    """Token and cost totals over processing runs (cost is known for providers with configured prices)."""
+    calls = [c for r in runs for c in (r.llm_calls or []) if not c.get("cached")]
+    made = [c for c in calls if c.get("input_tokens") is not None]
+    runs_with_ai = sum(1 for r in runs if any(c.get("input_tokens") is not None for c in (r.llm_calls or [])))
+    cost = sum(c.get("cost_usd") or 0 for c in made)
+    return {"runs": runs_with_ai, "calls": len(made), "failed_calls": sum(1 for c in calls if not c.get("ok")),
+            "input_tokens": sum(c.get("input_tokens") or 0 for c in made),
+            "output_tokens": sum(c.get("output_tokens") or 0 for c in made),
+            "cost_usd": round(cost, 6) if any(c.get("cost_usd") is not None for c in made) else None,
+            "avg_cost_per_run_usd": round(cost / runs_with_ai, 6)
+            if runs_with_ai and any(c.get("cost_usd") is not None for c in made) else None}
+
+
 def _run_payload(run: m.ProcessingRun | None) -> dict | None:
     if not run:
         return None
@@ -203,9 +253,11 @@ def _run_payload(run: m.ProcessingRun | None) -> dict | None:
     return {"run_no": run.run_no, "trigger": run.trigger, "rules_hash": run.rules_hash, "started_at": run.started_at,
             "finished_at": run.finished_at, "extraction": (run.extraction or {}).get("result"),
             "validation": run.validation, "matching": run.matching, "duplicates": run.duplicates,
-            "decision": run.decision, "ai_summary": run.ai_summary,
+            "decision": run.decision, "controls": run.controls, "ai_summary": run.ai_summary,
             "ai_calls": [{k: c.get(k) for k in ("purpose", "model", "served_by", "ok", "error", "latency_ms",
-                                                "input_tokens", "output_tokens", "cached")} for c in calls],
+                                                "input_tokens", "output_tokens", "cached", "cached_input_tokens",
+                                                "reasoning_tokens", "cost_usd")} for c in calls],
+            "ai_usage": ai_usage([run]),
             "rules": run.rules_snapshot}
 
 
@@ -246,7 +298,11 @@ def invoice_detail(invoice_id: int, db: Session = Depends(get_db), user: str = D
                "reviews": [{"id": r.id, "action": r.action_type, "reason": r.reason, "user": r.user_name,
                             "before": r.before, "after": r.after, "created_at": r.created_at} for r in reviews],
                "corrections": inv.corrections, "confirmed_po_id": inv.confirmed_po_id,
-               "duplicate_resolution": inv.duplicate_resolution, "ai_disclaimer": AI_DISCLAIMER})
+               "duplicate_resolution": inv.duplicate_resolution, "ai_disclaimer": AI_DISCLAIMER,
+               "adjustments": adjustments(db, inv),
+               "original_invoice": _invoice_summary(inv.original_invoice) if inv.original_invoice else None,
+               "viewer": user_info(user, db.get(m.UserProfile, user)),
+               "manager_required": manager_required(db, run)})
 
 
 @router.get("/invoices/{invoice_id}/progress")
@@ -393,7 +449,10 @@ def final(invoice_id: int, body: FinalBody, db: Session = Depends(get_db), user:
     if inv.status != "PROCESSED":
         err(409, "NOT_PROCESSED", "The invoice has not finished processing.")
     try:
-        final_decision(db, inv, body.decision, body.reason, user)
+        final_decision(db, inv, body.decision, body.reason, user, user_role(user))
+    except ManagerApprovalRequired as e:
+        db.rollback()
+        err(403, "MANAGER_APPROVAL_REQUIRED", e.message)
     except POBalanceExceeded as e:
         db.rollback()
         err(409, "PO_BALANCE_EXCEEDED", e.message, e.evidence)
@@ -412,10 +471,11 @@ def stats(db: Session = Depends(get_db), user: str = Depends(current_user)):
         if i.decision in by:
             by[i.decision] += 1
         if i.grand_total is not None and i.currency:
-            value[i.currency] = value.get(i.currency, Decimal(0)) + i.grand_total
+            amt = -abs(i.grand_total) if i.document_type == "CREDIT_NOTE" else i.grand_total  # credits reduce value
+            value[i.currency] = value.get(i.currency, Decimal(0)) + amt
             if i.decision:
                 d = value_by_decision.setdefault(i.decision, {})
-                d[i.currency] = d.get(i.currency, Decimal(0)) + i.grand_total
+                d[i.currency] = d.get(i.currency, Decimal(0)) + amt
     activity = db.scalars(select(m.AuditEvent).where(m.AuditEvent.event_type.in_(
         ["DOCUMENT_UPLOADED", "DECISION_GENERATED", "HUMAN_ACTION", "FINAL_DECISION", "PROCESSING_FAILED"]))
         .order_by(m.AuditEvent.id.desc()).limit(15)).all()
@@ -425,6 +485,12 @@ def stats(db: Session = Depends(get_db), user: str = Depends(current_user)):
                "processing": sum(1 for i in invs if i.status in ("RECEIVED", "PROCESSING")),
                "failed": sum(1 for i in invs if i.status == "FAILED"),
                "human_decided": sum(1 for i in invs if i.decided_by == "HUMAN"),
+               "awaiting_manager": sum(1 for i in invs if i.approval_level == "MANAGER" and i.decision == "MANUAL_REVIEW"),
+               "risk_flagged": sum(1 for i in invs if i.risk_flags),
+               "notes": sum(1 for i in invs if (i.document_type or "INVOICE") != "INVOICE"),
+               "tds_withheld": {"INR": sum((i.tds_amount for i in invs if i.decision == "APPROVED" and i.tds_amount),
+                                           Decimal(0))},
+               "ai_usage": ai_usage(db.scalars(select(m.ProcessingRun)).all()),
                "total_value": value, "value_by_decision": value_by_decision,
                "recent_activity": [{"invoice_id": e.invoice_id, "filename": names.get(e.invoice_id),
                                     "event_type": e.event_type, "message": e.message, "actor": e.actor,
@@ -439,7 +505,45 @@ def vendors(db: Session = Depends(get_db), user: str = Depends(current_user)):
     counts = dict(db.execute(select(m.PurchaseOrder.vendor_id, func.count()).group_by(m.PurchaseOrder.vendor_id)).all())
     return ok([{"id": v.id, "code": v.code, "name": v.name, "tax_id": v.tax_id, "tax_id_type": v.tax_id_type,
                 "country": v.country, "status": v.status, "default_currency": v.default_currency, "address": v.address,
-                "po_count": counts.get(v.id, 0)} for v in rows])
+                "po_count": counts.get(v.id, 0), "bank_account": v.bank_account, "bank_ifsc": v.bank_ifsc,
+                "einvoice_required": bool(v.einvoice_required), "tds_section": v.tds_section} for v in rows])
+
+
+class VendorPatch(BaseModel):
+    bank_account: str | None = Field(None, max_length=40)
+    bank_ifsc: str | None = Field(None, max_length=16)
+    einvoice_required: bool | None = None
+    tds_section: str | None = Field(None, max_length=8)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@router.patch("/vendors/{code}")
+def update_vendor(code: str, body: VendorPatch, db: Session = Depends(get_db), user: str = Depends(current_user)):
+    """Payment / compliance master data. Bank details are a fraud target, so only a manager may change them."""
+    v = db.scalar(select(m.Vendor).where(m.Vendor.code == code))
+    if not v:
+        err(404, "NOT_FOUND", f"Vendor {code} not found.")
+    changes = body.model_dump(exclude_unset=True, exclude={"reason"})
+    if not changes:
+        err(422, "NOTHING_TO_CHANGE", "No fields to change.")
+    if ({"bank_account", "bank_ifsc"} & set(changes)) and user_role(user) != "MANAGER":
+        err(403, "MANAGER_REQUIRED", "Only a manager can change a vendor's bank details.")
+    if "tds_section" in changes and changes["tds_section"]:
+        sections = effective_rules(db)["tds"]["sections"]
+        changes["tds_section"] = changes["tds_section"].strip().upper()
+        if changes["tds_section"] not in sections:
+            err(422, "UNKNOWN_TDS_SECTION", f"TDS section must be one of {', '.join(sections)}.")
+    for k in ("bank_account", "bank_ifsc"):
+        if k in changes and changes[k] is not None:
+            changes[k] = "".join(changes[k].split()).replace("-", "").upper() or None
+    before = {k: getattr(v, k) for k in changes}
+    for k, val in changes.items():
+        setattr(v, k, bool(val) if k == "einvoice_required" else (val or None))
+    masked = lambda d: {k: ("••••" + str(x)[-4:] if k == "bank_account" and x else x) for k, x in d.items()}  # noqa: E731
+    audit_log(db, None, "VENDOR_UPDATED", f"{user} updated vendor {v.code} ({', '.join(changes)}): {body.reason}",
+              {"vendor": v.code, "before": masked(before), "after": masked(changes)}, None, user)
+    db.commit()
+    return vendors(db, user)
 
 
 @router.get("/purchase-orders")
@@ -448,6 +552,65 @@ def purchase_orders(db: Session = Depends(get_db), user: str = Depends(current_u
     pos = db.scalars(select(m.PurchaseOrder).options(selectinload(m.PurchaseOrder.lines),
                                                      selectinload(m.PurchaseOrder.vendor)).order_by(m.PurchaseOrder.id))
     return ok([po_snapshot(p, consumed) for p in pos])
+
+
+class POLineIn(BaseModel):
+    item_code: str | None = Field(None, max_length=40)
+    description: str = Field(min_length=1, max_length=500)
+    uom: str | None = Field(None, max_length=16)
+    quantity: Decimal = Field(gt=0, max_digits=14, decimal_places=4)
+    unit_price: Decimal = Field(ge=0, max_digits=16, decimal_places=4)
+    tax_rate: Decimal = Field(Decimal("0"), ge=0, le=100, decimal_places=3)
+
+
+class POIn(BaseModel):
+    po_number: str = Field(min_length=2, max_length=40, pattern=r"^\s*[A-Za-z0-9][A-Za-z0-9\-/_.]*\s*$")
+    vendor_code: str = Field(min_length=1, max_length=32)
+    po_date: date
+    currency: str | None = Field(None, min_length=3, max_length=3)
+    status: Literal["APPROVED", "CLOSED", "CANCELLED"] = "APPROVED"
+    description: str | None = Field(None, max_length=500)
+    qty_tolerance_pct: Decimal | None = Field(None, ge=0, le=100)
+    price_tolerance_pct: Decimal | None = Field(None, ge=0, le=100)
+    amount_tolerance_pct: Decimal | None = Field(None, ge=0, le=100)
+    lines: list[POLineIn] = Field(min_length=1, max_length=100)
+
+
+@router.post("/purchase-orders", status_code=201)
+def create_purchase_order(body: POIn, db: Session = Depends(get_db), user: str = Depends(current_user)):
+    """Enter one PO by hand. Line amounts and totals are computed here (never taken from the client),
+    and the PO is used by matching from the next invoice on."""
+    number = body.po_number.strip().upper()
+    if db.scalar(select(m.PurchaseOrder.id).where(m.PurchaseOrder.po_number == number)):
+        err(409, "PO_EXISTS", f"{number} already exists.")
+    vendor = db.scalar(select(m.Vendor).where(m.Vendor.code == body.vendor_code.strip()))
+    if vendor is None:
+        err(422, "UNKNOWN_VENDOR", f"Vendor {body.vendor_code} does not exist - add or import the vendor first.")
+    if vendor.status == "BLOCKED":
+        err(422, "VENDOR_BLOCKED", f"{vendor.name} is BLOCKED; a purchase order cannot be raised for it.")
+    currency = (body.currency or vendor.default_currency).upper()
+    allowed = supported_currencies(effective_rules(db))
+    if currency not in allowed:
+        err(422, "UNSUPPORTED_CURRENCY", f"Currency must be one of {', '.join(sorted(allowed))} - a manager can add "
+                                         "more currencies (with an approval limit) on the Rules & data page.")
+    if body.po_date > date.today():
+        err(422, "FUTURE_DATE", "The PO date cannot be in the future.")
+    po = po_from_dict(db, {
+        "po_number": number, "vendor": vendor.code, "po_date": body.po_date.isoformat(), "status": body.status,
+        "currency": currency, "description": (body.description or "").strip() or None,
+        "qty_tolerance_pct": body.qty_tolerance_pct, "price_tolerance_pct": body.price_tolerance_pct,
+        "amount_tolerance_pct": body.amount_tolerance_pct,
+        "lines": [{"item_code": (ln.item_code or "").strip() or None, "description": ln.description.strip(),
+                   "uom": (ln.uom or "").strip().upper() or None, "quantity": ln.quantity,
+                   "unit_price": ln.unit_price, "tax_rate": ln.tax_rate} for ln in body.lines]},
+        {vendor.code: vendor})
+    db.flush()
+    audit_log(db, None, "PO_CREATED", f"{number} created by {user} for {vendor.name}: {len(po.lines)} line(s), "
+                                      f"net {po.subtotal} {currency}.", {"po_number": number}, None, user)
+    db.commit()
+    po = db.scalar(select(m.PurchaseOrder).where(m.PurchaseOrder.id == po.id)
+                   .options(selectinload(m.PurchaseOrder.lines), selectinload(m.PurchaseOrder.vendor)))
+    return ok(po_snapshot(po, consumption_by_line(db)), 201)
 
 
 @router.get("/purchase-orders/{po_number}")
@@ -472,7 +635,8 @@ def purchase_order(po_number: str, db: Session = Depends(get_db), user: str = De
 @router.get("/config/rules")
 def get_rules(db: Session = Depends(get_db), user: str = Depends(current_user)):
     ov = db.scalar(select(m.RuleOverride).order_by(m.RuleOverride.id.desc()).limit(1))
-    return ok({"effective": effective_rules(db), "defaults": load_default_rules(),
+    eff = effective_rules(db)
+    return ok({"effective": eff, "defaults": load_default_rules(), "supported_currencies": sorted(supported_currencies(eff)),
                "overrides": ov.overrides if ov else {}, "updated_by": ov.updated_by if ov else None,
                "updated_at": ov.updated_at if ov else None})
 
@@ -482,6 +646,7 @@ class RulesBody(BaseModel):
 
 
 POLICY_VALUES = {"MANUAL_REVIEW", "REJECT"}
+FLAG_ALLOWED = {"policy.near_limit", "policy.month_end_arrival", "policy.debit_note"}  # may also be FLAG (no review)
 # values that are fractions / probabilities and must stay within 0..1
 FRACTION_RULES = {"extraction.min_confidence", "duplicates.probable_threshold", "matching.line_min_similarity",
                   "matching.min_description_evidence"}
@@ -495,6 +660,13 @@ def validate_rule_overrides(overrides: dict, defaults: dict) -> None:
             err(422, "INVALID_RULE", f"{path or 'overrides'} must be an object")
         for k, v in o.items():
             name = f"{path}{k}"
+            if path == "approval.auto_approve_limit.":
+                # any ISO 4217 code; null removes a currency's limit (its invoices then need a manager)
+                if not re.fullmatch(r"[A-Z]{3}", k):
+                    err(422, "INVALID_RULE", f"{k!r} is not a 3-letter currency code (e.g. GBP)")
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+                    err(422, "INVALID_RULE", f"The {k} approval limit must be a non-negative number")
+                continue
             if k not in d:
                 err(422, "UNKNOWN_RULE", f"Unknown rule {name}")
             ref = d[k]
@@ -514,8 +686,9 @@ def validate_rule_overrides(overrides: dict, defaults: dict) -> None:
             elif isinstance(ref, str):
                 if not isinstance(v, str) or not v.strip():
                     err(422, "INVALID_RULE", f"{name} must be text")
-                if path == "policy." and v not in POLICY_VALUES:
-                    err(422, "INVALID_RULE", f"{name} must be one of {', '.join(sorted(POLICY_VALUES))}")
+                allowed = POLICY_VALUES | ({"FLAG"} if name in FLAG_ALLOWED else set())
+                if path == "policy." and v not in allowed:
+                    err(422, "INVALID_RULE", f"{name} must be one of {', '.join(sorted(allowed))}")
 
     walk(overrides, defaults)
     merged = deep_merge(defaults, overrides)
@@ -532,7 +705,21 @@ def put_rules(body: RulesBody, db: Session = Depends(get_db), user: str = Depend
     defaults = load_default_rules()
 
     validate_rule_overrides(body.overrides, defaults)
+    # Approval limits decide who may approve what, so a reviewer cannot raise their own limit.
+    before, after = effective_rules(db), deep_merge(defaults, body.overrides)
+    approval_keys = ("above_approval_limit", "near_limit", "split_below_limit")
+    if after.get("approval", {}).get("above_limit_approver") not in ("REVIEWER", "MANAGER"):
+        err(422, "INVALID_RULE", "approval.above_limit_approver must be REVIEWER or MANAGER")
+    approval_changed = before.get("approval") != after.get("approval") or any(
+        before["policy"].get(k) != after["policy"].get(k) for k in approval_keys)
+    if approval_changed and user_role(user) != "MANAGER":
+        err(403, "MANAGER_REQUIRED", "Only a manager can change the approval limits.")
     db.add(m.RuleOverride(overrides=body.overrides, updated_by=user))
+    if approval_changed:
+        audit_log(db, None, "APPROVAL_LIMITS_CHANGED",
+                  f"{user} changed the approval limits: {before.get('approval', {}).get('auto_approve_limit')} -> "
+                  f"{after['approval']['auto_approve_limit']}.",
+                  {"before": before.get("approval"), "after": after["approval"]}, None, user)
     db.commit()
     return get_rules(db, user)
 

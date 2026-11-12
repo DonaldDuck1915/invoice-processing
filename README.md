@@ -4,7 +4,7 @@ A working prototype that takes one vendor invoice PDF (digital or scanned) and p
 
 ```
 frontend/  React + TypeScript + Vite + Tailwind  → deploy on Vercel
-backend/   FastAPI + SQLAlchemy (SQLite locally, Postgres on Render) + Tesseract OCR + Gemini or Claude (optional)
+backend/   FastAPI + SQLAlchemy (SQLite locally, Postgres on Render) + Tesseract OCR + OpenAI (optional)
 render.yaml  Render blueprint (API as Docker + Postgres)
 ```
 
@@ -19,13 +19,15 @@ PDF ─► ingest (magic bytes, size, pages, SHA-256)
     ─► match PO: explicit number → OCR-tolerant number → ranked candidates (weighted, transparent)
                line alignment (Hungarian) → variances vs REMAINING PO balance (ledger)
     ─► duplicates: identical file / exact rule / weighted similarity + content fingerprint
+    ─► AP controls: approval limit (manager above it), fraud signals, GST e-invoice IRN/QR, TDS;
+               credit / debit notes are linked to their original invoice instead of PO-matched
     ─► decide: every rule evaluated; REJECT > MANUAL_REVIEW > APPROVED;
                a reject that depends on an unreliable reading is downgraded to review
     ─► ledger: approved invoices consume PO quantity/value (one row per PO line per invoice)
     ─► AI summary (optional, labelled "AI and can make mistakes. Please double-check responses.")
 ```
 
-**Where the AI is (and isn't) used.** The AI (Google Gemini or Anthropic Claude, whichever key you set) reads fields from the PDF, judges what descriptions *mean* (one signal worth 30 of the 100 PO-matching points), writes the plain-language summary, and recommends the reviewer's next step (confirm a PO, ask the vendor, correct fields, escalate ...) with a draft vendor e-mail. Recommendations are advisory: they are checked in code (fixed action list, suggested PO must be a real candidate, never "approve" for a rejected invoice) and nothing is applied without a reviewer click, which is logged. Code does all arithmetic, tolerances, PO selection, duplicate detection and the final decision. The AI never sees amounts when scoring meaning. Without an API key the system runs rules-only and becomes stricter: an inferred PO match then always needs confirmation.
+**Where the AI is (and isn't) used.** The AI (OpenAI, `gpt-6-luna` by default) reads fields from the PDF, judges what descriptions *mean* (one signal worth 30 of the 100 PO-matching points), writes the plain-language summary, and recommends the reviewer's next step (confirm a PO, ask the vendor, correct fields, escalate ...) with a draft vendor e-mail. Recommendations are advisory: they are checked in code (fixed action list, suggested PO must be a real candidate, never "approve" for a rejected invoice) and nothing is applied without a reviewer click, which is logged. Code does all arithmetic, tolerances, PO selection, duplicate detection and the final decision. The AI never sees amounts when scoring meaning. Without an API key the system runs rules-only and becomes stricter: an inferred PO match then always needs confirmation.
 
 All money is Python `Decimal` and is stored and transmitted as exact strings. Rules live in `backend/app/rules.yaml`, can be overridden on the **Rules & data** page, and are snapshotted into every run.
 
@@ -39,6 +41,22 @@ All money is Python `Decimal` and is stored and transmitted as exact strings. Ru
 | EC4 | No PO number; vendor has PO-101/102/103 | Vendor by GSTIN, candidates ranked on 6 signals with evidence. "Office supplies ₹50,000" is ambiguous → **review** with one-click confirmation. Clear line items → auto-selected when AI is on. |
 
 | EC5 | Prices include GST ("All prices are inclusive of GST", 2,950/stand vs PO 2,500 net) | Detected from the document; tax is checked as *contained* in the totals (gross − gross/1.18), and lines are converted to net before PO matching and the ledger, so it is **approved** instead of looking like an 18% price variance. |
+
+## AP controls (samples 24-33)
+
+| Control | How it works | Sample → result |
+|---|---|---|
+| **Approval limits** | `approval.auto_approve_limit` per currency (₹5,00,000 / €15,000 / $15,000 gross). Above it the invoice goes to review and **only the `manager` account can approve it** (the API refuses a reviewer's approval with 403; a reviewer can still reject). Within 5% below the limit → *just under limit* flag; a second just-under invoice from the same vendor within 30 days → review as a **possible split**. Credit notes are exempt. | 26 → review, manager only · 27 → approved + flag · 28 → review (split) |
+| **Credit notes** | Detected from the title ("CREDIT NOTE"); the "Against Invoice No" reference links it to the original (same vendor). It must be approved, same currency, and may not credit more than is left on it or return more units than were billed. Returned goods (same unit price) go back to the PO line as negative ledger rows; price/discount lines reduce value only. The original's page shows **net owed after notes**. | 24 (after 03) → approved; invoice 03 nets to ₹3,24,500 and PO-2001 shows 5 chairs free again |
+| **Debit notes** | Linked the same way; value lines add to the PO's consumed value (checked against the PO value tolerance), extra-quantity lines must fit the remaining PO quantity. Default policy: buyer confirms (review). | 25 (after 01) → review |
+| **Bank details** | Bank account / IBAN and IFSC / SWIFT are extracted and compared with the vendor master (or the vendor's earlier invoices). A change → review with "call the vendor on a known number". Account numbers are masked everywhere. Only a manager can change bank details in the vendor master; the change is audited. | 29 → review; 30 → bank matches |
+| **Unusual amount** | More than 3x the vendor's median invoice (once 3+ invoices exist) → review. | unit-tested |
+| **Invoice before PO** | Invoice date earlier than the matched PO's date (retro PO) → review. | 30 → review |
+| **Month-end arrival** | Received in the last 2 days of a month → flag (configurable to review). | unit-tested |
+| **GST e-invoice** | For vendors flagged "must e-invoice": IRN must be present and a 64-character hex reference; the signed QR code is decoded (OpenCV) and its seller/buyer GSTIN, document number, type, value and IRN are compared with what is printed. Missing → review; any contradiction → review + high-risk flag (document altered after the IRN was issued). The QR's signature is **not** verified (needs the IRP public key). Any invoice that prints an IRN/QR is checked even if not required. | 31 → approved · 32 → review · 33 → review (QR value ≠ printed total) |
+| **TDS** | Vendor master holds the TDS section (194C / 194J / 194I / 194Q); rate and single/annual thresholds come from `rules.yaml`. Base = value excluding GST; financial-year aggregate from approved invoices; 194Q taxes only the part above the annual threshold; rounded to the rupee. The decision's next action says what to pay the vendor and what TDS to deposit; credit notes reverse TDS proportionally. | 31 → 2% of ₹1,80,000 = ₹3,600 withheld, pay ₹2,08,800 |
+
+Every control outcome is a policy in `rules.yaml` (`MANUAL_REVIEW` / `REJECT`, and `FLAG` for the soft ones), shown on the invoice's **Controls & payment** tab and in the live run view (*AP controls* stage). Sign in as `manager` / `manage123` (set `MANAGER_PASSWORD`) to approve above the limit. TDS rates and thresholds are configurable defaults - confirm them with your tax team.
 
 Also included: cancelled PO (reject), PO belonging to another vendor (reject), blocked or pending vendor (flagged review), currency mismatch (review), missing invoice number plus line-math error (review), low-quality scan (review), corrupt and non-PDF files (clean error).
 
@@ -61,7 +79,7 @@ cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt          # also needs Tesseract OCR (below)
 python scripts/generate_samples.py           # demo PDFs → backend/samples/
-cp .env.example .env                         # optionally add GEMINI_API_KEY (or ANTHROPIC_API_KEY)
+cp .env.example .env                         # optionally add OPENAI_API_KEY
 uvicorn app.main:app --reload --port 8000
 pytest -q                                    # 82 tests (scanned-PDF ones skip without Tesseract)
 ```
@@ -79,7 +97,7 @@ npm run dev                                  # http://localhost:5173  (reviewer 
 
 1. Push this repo to GitHub.
 2. **Render** → New → Blueprint → pick the repo (uses `render.yaml`). It creates the Postgres DB and the Docker API service (Tesseract included). When prompted, set:
-   - `GEMINI_API_KEY` (optional; enables AI. `ANTHROPIC_API_KEY` works too)
+   - `OPENAI_API_KEY` (optional; enables AI - without it the app runs rules-only)
    - `REVIEWER_PASSWORD` (choose a strong one)
    - `ALLOWED_ORIGINS` = your Vercel URL, e.g. `https://invoice-ai.vercel.app`
 3. **Vercel** → New Project → root directory `frontend` (framework: Vite) → env var `VITE_API_URL` = the Render API URL.
@@ -87,20 +105,20 @@ npm run dev                                  # http://localhost:5173  (reviewer 
 
 Notes: Render's free web service sleeps when idle (the first request can take ~1 minute), and its free Postgres expires after 30 days. Uploaded PDFs are stored in the database, so no disk is needed.
 
-## AI provider (Gemini)
+## AI provider (OpenAI)
 
-Set `GEMINI_API_KEY` (from [Google AI Studio](https://aistudio.google.com/apikey)) in `backend/.env` locally, or as a secret on Render. `ANTHROPIC_API_KEY` works as an alternative; with both set, Gemini is used unless `LLM_PROVIDER=anthropic`.
+Set `OPENAI_API_KEY` in `backend/.env` locally, or as a secret on Render (get one at https://platform.openai.com/api-keys). Calls use the Responses API with strict JSON-schema output; the PDF is sent inline (`store=false`, nothing is kept on OpenAI's side).
 
-| Job | Setting | Default | Why |
-|---|---|---|---|
-| Read the invoice PDF (extraction) | `GEMINI_MODEL` | `gemini-3.6-flash` | Accurate on PDFs; ~4-8 s per invoice with low thinking |
-| Summary + recommendation, description meaning | `GEMINI_FAST_MODEL` | `gemini-3.5-flash-lite` | Short reasoning over facts; ~2 s and the cheapest tier |
-| Fallback when a model is overloaded (503/504) | `GEMINI_FALLBACK_MODEL` | the other model | One retry on a different model instead of dropping to rules-only |
-| Thinking effort | `GEMINI_THINKING` | `auto` (low) | Higher levels add latency without changing the rule-based outcome |
-| Give up on a slow call | `LLM_TIMEOUT_SECONDS` | `60` | The invoice then continues rules-only |
+| Setting | Default | Notes |
+|---|---|---|
+| `OPENAI_MODEL` | `gpt-6-luna` | Cheapest GPT-6 tier; used for every call unless a fast model is set |
+| `OPENAI_FAST_MODEL` | (same) | Optional separate model for summary / recommendation / description meaning |
+| `OPENAI_FALLBACK_MODEL` | (none) | Tried once when the first model is overloaded or times out |
+| `OPENAI_REASONING` | `auto` (low; medium for PDF extraction) | Higher effort costs more output tokens |
+| `OPENAI_PDF_DETAIL` | `auto` | `low` renders PDF pages with fewer tokens (cheaper, slightly less robust on scans) |
+| `OPENAI_PRICE_*_PER_M` | 0.10 / 0.01 cached / 0.50 | USD per 1M tokens, only used to show cost; update if OpenAI changes prices |
 
-A model that times out or is overloaded is skipped for the rest of that run, so an invoice never waits twice for the same slow model. Every run lists its AI calls (purpose, model, latency, tokens, errors). If the AI fails (bad key, wrong model, quota), the invoice is still processed rules-only and the reason is shown.
-
+A model that is overloaded or times out (`LLM_TIMEOUT_SECONDS`, default 60) is skipped for the rest of that run and the fallback model, if set, is tried; otherwise the invoice continues rules-only and the reason is shown. Each run records tokens and estimated cost per AI call; the decision report shows the run's total and the dashboard shows the total and average per run.
 ## Using your own data
 
 **Rules & data → Import** accepts JSON (example prefilled on the page):
@@ -116,8 +134,10 @@ Set your own company's tax ID in `rules.yaml → company.tax_ids` so it is never
 ## Known limitations
 
 - The rule-based parser is tuned on label/table conventions common in Indian GST, EU and US invoices. Unusual layouts rely on the AI extractor or on reviewer correction.
-- A single reviewer account, no payments or ERP integration (deliberately out of scope).
+- Two fixed accounts (reviewer, manager) rather than user management; no payments or ERP integration (deliberately out of scope).
+- E-invoice QR signatures are not verified against the IRP public key, and the IRN is not checked against the GST portal (no live API access). Amount limits are per currency, not converted.
+- Credit/debit notes must cite the original invoice number; a note covering several invoices is not split automatically.
 - Tax-inclusive detection relies on the document saying so ("inclusive of GST", "VAT included", ...); a reviewer can still correct lines if a vendor prints gross prices silently.
 - Processing runs in the API process (threads), not a separate job queue; interrupted runs are re-queued on restart.
-- No database migrations: the schema is created on startup, so a schema change on an existing Postgres database needs a reset or a manual migration.
-- Currencies are compared, never converted; supported: INR, EUR, USD.
+- Schema changes are applied by a small "add missing columns" step at startup (new nullable columns only); renames or type changes would still need a manual migration.
+- Currencies are compared, never converted. INR, EUR and USD are built in; a manager can add any other currency (e.g. GBP, AED) by giving it an approval limit on Rules & data. An invoice in a currency with no limit always needs a manager.

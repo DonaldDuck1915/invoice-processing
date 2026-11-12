@@ -10,6 +10,8 @@ Confidence below `extraction.min_confidence` always becomes UNCERTAIN.
 """
 from __future__ import annotations
 
+import re
+
 from rapidfuzz import fuzz
 
 from ..llm import LLMClient, LLMUnavailable
@@ -18,6 +20,7 @@ from ..schemas import DATE_FIELDS, HEADER_FIELDS, MONEY_FIELDS, ExtractedInvoice
 from .llm_extractor import extract_with_llm
 from .parsers import normalize_ref, normalize_tax_id, parse_date
 from .pdf_reader import DocumentText, read_document
+from .qr import decode_qr_codes
 from .rule_extractor import extract_with_rules
 
 
@@ -33,8 +36,15 @@ def _normalise(name: str, value: str | None, prefer: str) -> str | None:
         return d.isoformat() if d else None
     if name == "vendor_tax_id":
         return normalize_tax_id(v)
-    if name in ("invoice_number", "po_number"):
+    if name in ("invoice_number", "po_number", "original_invoice_number"):
         return v.upper()
+    if name == "document_type":
+        t = re.sub(r"[^A-Z]", "", v.upper())
+        return "CREDIT_NOTE" if "CREDIT" in t else "DEBIT_NOTE" if "DEBIT" in t else "INVOICE" if "INVOICE" in t else None
+    if name in ("bank_account", "bank_ifsc"):
+        return re.sub(r"[\s\-.]", "", v).upper() or None
+    if name == "irn":
+        return re.sub(r"\s", "", v).lower() or None
     if name == "currency":
         return v.upper()[:3]
     return v
@@ -45,7 +55,8 @@ def _same(name: str, a: str | None, b: str | None) -> bool:
         return False
     if name in MONEY_FIELDS:
         return D(a) == D(b)
-    if name in ("invoice_number", "po_number", "vendor_tax_id"):
+    if name in ("invoice_number", "po_number", "vendor_tax_id", "original_invoice_number", "bank_account", "bank_ifsc",
+                "irn"):
         return normalize_ref(a) == normalize_ref(b)
     if name in ("vendor_name", "vendor_address"):
         return fuzz.token_set_ratio(a.lower(), b.lower()) >= 90
@@ -189,6 +200,10 @@ def extract(pdf_bytes: bytes, rules: dict, llm: LLMClient, settings) -> tuple[Ex
         except LLMUnavailable as e:
             ai_error = str(e)
     inv = merge(rule_inv, ai, doc.is_scanned)
+    try:
+        inv.meta["qr_codes"] = decode_qr_codes(pdf_bytes, settings.max_pages)
+    except Exception as e:  # noqa: BLE001 - QR reading is best-effort
+        inv.meta["qr_codes"], inv.meta["qr_error"] = [], str(e)
     inv.meta["ai_used"] = ai is not None
     inv.meta["ai_error"] = ai_error
     inv.meta["warnings"] = doc.warnings

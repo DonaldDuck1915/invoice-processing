@@ -1,15 +1,14 @@
-"""AI layer used for extraction, description meaning and summaries.
+"""AI layer (OpenAI) used for extraction, description meaning, the summary and the review recommendation.
 
-Two interchangeable providers - Google Gemini and Anthropic Claude - behind one `json_call`.
-The model never computes amounts or decides outcomes. Every call is logged (purpose, provider,
-model, latency, token usage, outcome) so it can be shown in the audit trail.
+Everything goes through one `json_call` that returns JSON matching a strict schema. The model never
+computes amounts or decides outcomes. Every call is logged (purpose, model, latency, tokens, cost,
+outcome) so it can be shown in the audit trail and on the dashboard.
 
-Content blocks are provider-neutral: {"type": "text", "text": ...} and {"type": "pdf", "data": bytes}.
+Content blocks: {"type": "text", "text": ...} and {"type": "pdf", "data": bytes}.
 """
 from __future__ import annotations
 
 import base64
-import copy
 import hashlib
 import json
 import logging
@@ -42,31 +41,16 @@ def _cache_key(purpose: str, system: str, blocks: list[dict], schema: dict) -> s
     return h.hexdigest()
 
 
-def gemini_schema(schema: Any) -> Any:
-    """Gemini accepts JSON Schema but not every keyword; drop `additionalProperties` (it only
-    restates 'no extra keys', which `properties` + `required` already imply)."""
-    s = copy.deepcopy(schema)
-
-    def walk(node):
-        if isinstance(node, dict):
-            node.pop("additionalProperties", None)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(s)
-    return s
-
-
 class LLMClient:
+    # Short reasoning over facts (meaning of descriptions, summary + recommendation) can use a
+    # cheaper / faster model than reading the PDF, where accuracy matters most.
+    FAST_PURPOSES = {"decision_summary", "description_meaning"}
+
     def __init__(self):
         self.settings = get_settings()
         self.calls: list[dict[str, Any]] = []
         self._cache: dict[str, Any] = {}
-        self._anthropic = None
-        self._gemini = None
+        self._openai = None
         self._down: dict[str, str] = {}  # model -> why it was unavailable in this run
 
     # ------------------------------------------------------------------ status
@@ -82,25 +66,17 @@ class LLMClient:
     def model_name(self) -> str | None:
         return self.settings.ai_model
 
-    # Short, high-volume reasoning (meaning of descriptions, summary + recommendation) can use a
-    # cheaper / faster model than reading the PDF, where accuracy matters most.
-    FAST_PURPOSES = {"decision_summary", "description_meaning"}
+    def model_for(self, purpose: str) -> str:
+        st = self.settings
+        return st.openai_fast_model if purpose in self.FAST_PURPOSES and st.openai_fast_model else st.openai_model
 
-    def model_for(self, purpose: str) -> str | None:
-        if self.provider == "gemini":
-            if purpose in self.FAST_PURPOSES and self.settings.gemini_fast_model:
-                return self.settings.gemini_fast_model
-            return self.settings.gemini_model
-        return self.model_name
-
-    def models_for(self, purpose: str) -> list[str | None]:
-        """Preferred model first, then the fallback (Gemini only) for when the first is overloaded."""
+    def models_for(self, purpose: str) -> list[str]:
+        """Preferred model first, then one fallback for when the first is overloaded or times out."""
         first = self.model_for(purpose)
-        if self.provider != "gemini":
-            return [first]
-        fallbacks = [m for m in (self.settings.gemini_fallback_model, self.settings.gemini_model,
-                                 self.settings.gemini_fast_model) if m]
-        return [first] + [m for m in dict.fromkeys(fallbacks) if m != first][:1]
+        st = self.settings
+        others = [m for m in dict.fromkeys(x for x in (st.openai_fallback_model, st.openai_model,
+                                                       st.openai_fast_model) if x) if m != first]
+        return [first] + others[:1]
 
     @staticmethod
     def _transient(error: str) -> bool:
@@ -113,10 +89,10 @@ class LLMClient:
         """Ask the model for JSON matching `schema`. Raises LLMUnavailable on any failure.
 
         A model that is overloaded or times out is skipped for the rest of this run (an invoice never
-        waits for the same slow model twice) and the fallback model is tried instead; when every model
-        is unavailable the caller continues rules-only."""
+        waits for the same slow model twice) and the fallback model, if any, is tried instead; when no
+        model is available the caller continues rules-only."""
         if not self.available:
-            raise LLMUnavailable("AI is not configured (set GEMINI_API_KEY or ANTHROPIC_API_KEY).")
+            raise LLMUnavailable("AI is not configured (set OPENAI_API_KEY).")
         key = _cache_key(purpose, system, user_content, schema)
         if key in self._cache:
             self.calls.append({"purpose": purpose, "cached": True, "ok": True, "provider": self.provider})
@@ -138,15 +114,12 @@ class LLMClient:
                 self._down[model] = err
         raise last or LLMUnavailable("No AI model is available.")
 
-    def _attempt(self, purpose: str, model: str | None, system: str, user_content: list[dict], schema: dict,
+    def _attempt(self, purpose: str, model: str, system: str, user_content: list[dict], schema: dict,
                  effort: str, max_tokens: int, key: str) -> dict:
         t0 = time.time()
         entry: dict[str, Any] = {"purpose": purpose, "provider": self.provider, "model": model, "ok": False}
         try:
-            if self.provider == "gemini":
-                text = self._call_gemini(system, user_content, schema, max_tokens, entry, effort)
-            else:
-                text = self._call_anthropic(system, user_content, schema, effort, max_tokens, entry)
+            text = self._call_openai(system, user_content, schema, max_tokens, entry, effort)
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as e:
@@ -162,147 +135,97 @@ class LLMClient:
             entry["latency_ms"] = int((time.time() - t0) * 1000)
             self.calls.append(entry)
 
-    # ------------------------------------------------------------------ Gemini
-    def _gemini_client(self):
-        if self._gemini is None:
-            from google import genai
-            from google.genai import types
+    # ------------------------------------------------------------------ OpenAI
+    def _openai_client(self):
+        if self._openai is None:
+            import openai
 
-            self._gemini = genai.Client(
-                api_key=self.settings.gemini_api_key,
-                http_options=types.HttpOptions(timeout=int(self.settings.llm_timeout_seconds * 1000)))
-        return self._gemini
+            # no SDK retries: an overloaded model is handled by the fallback model instead of waiting again
+            self._openai = openai.OpenAI(api_key=self.settings.openai_api_key, base_url=self.settings.openai_base_url,
+                                         timeout=self.settings.llm_timeout_seconds, max_retries=0)
+        return self._openai
 
-    def _call_gemini(self, system: str, blocks: list[dict], schema: dict, max_tokens: int, entry: dict,
+    def _call_openai(self, system: str, blocks: list[dict], schema: dict, max_tokens: int, entry: dict,
                      effort: str = "medium") -> str:
-        from google.genai import errors, types
+        """Responses API with strict JSON-schema output; the PDF is sent inline as a file part."""
+        import openai
 
-        parts = []
-        for b in blocks:
-            if b["type"] == "pdf":
-                parts.append(types.Part.from_bytes(data=b["data"], mime_type="application/pdf"))
-            else:
-                parts.append(types.Part.from_text(text=b["text"]))
-        model = entry.get("model") or self.settings.gemini_model
-        level = (self.settings.gemini_thinking or "auto").strip().lower()
-        if level == "auto":  # follow the caller: extraction reasons more than a summary does
-            level = {"low": "low", "medium": "low", "high": "medium"}.get(effort, "low")
-
-        def config(with_thinking: bool):
-            return types.GenerateContentConfig(
-                system_instruction=system, temperature=0.0, response_mime_type="application/json",
-                response_json_schema=gemini_schema(schema),
-                # thinking tokens count towards the output limit, so leave generous headroom
-                max_output_tokens=max(max_tokens, 16000),
-                thinking_config=types.ThinkingConfig(thinking_level=level.upper())
-                if with_thinking and level != "default" else None)
-
-        contents = [types.Content(role="user", parts=parts)]
-        try:
-            try:
-                resp = self._gemini_client().models.generate_content(model=model, contents=contents,
-                                                                     config=config(True))
-            except errors.APIError as e:
-                if getattr(e, "code", None) == 400 and "thinking" in str(e).lower():
-                    # this model does not accept the thinking level - use its default instead
-                    log.info("model %s rejected thinking_level=%s; retrying with its default", model, level)
-                    resp = self._gemini_client().models.generate_content(model=model, contents=contents,
-                                                                         config=config(False))
-                else:
-                    raise
-            entry["thinking_level"] = level
-        except errors.APIError as e:
-            code = getattr(e, "code", None)
-            msg = str(getattr(e, "message", "") or e)
-            entry["error"] = f"API error {code}"
-            if code in (401, 403) or (code == 400 and "api key" in msg.lower()):
-                raise LLMUnavailable("Gemini rejected the API key - check GEMINI_API_KEY.") from e
-            if code == 404:
-                raise LLMUnavailable(f"Gemini model '{model}' was not found - "
-                                     "set GEMINI_MODEL to a model listed in Google AI Studio.") from e
-            if code == 429:
-                raise LLMUnavailable("Gemini rate limit or quota reached.") from e
-            raise LLMUnavailable(f"Gemini service error ({code}): {msg[:160]}") from e
-        except Exception as e:  # noqa: BLE001 - network/timeout errors from the HTTP layer
-            entry["error"] = "Connection error / timeout"
-            log.warning("gemini call failed: %s", e)
-            raise LLMUnavailable("Could not reach the Gemini service.") from e
-
-        entry["served_by"] = getattr(resp, "model_version", None)
-        u = getattr(resp, "usage_metadata", None)
-        if u is not None:
-            entry["input_tokens"] = getattr(u, "prompt_token_count", None)
-            entry["output_tokens"] = getattr(u, "candidates_token_count", None)
-        cand = (resp.candidates or [None])[0]
-        reason = str(getattr(getattr(cand, "finish_reason", None), "value", getattr(cand, "finish_reason", "")) or "")
-        if cand is None:
-            block = getattr(getattr(resp, "prompt_feedback", None), "block_reason", None)
-            raise LLMUnavailable(f"Gemini returned no answer{f' (blocked: {block})' if block else ''}.")
-        if reason == "MAX_TOKENS":
-            raise LLMUnavailable("The AI response was cut off (max tokens).")
-        if reason in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"):
-            raise LLMUnavailable(f"Gemini declined to answer ({reason.lower()}).")
-        text = resp.text
-        if not text:
-            raise LLMUnavailable("The AI returned no text.")
-        return text
-
-    # ------------------------------------------------------------------ Anthropic
-    def _anthropic_client(self):
-        if self._anthropic is None:
-            import anthropic
-
-            kwargs = {"timeout": self.settings.llm_timeout_seconds, "max_retries": 2}
-            if self.settings.anthropic_api_key:
-                kwargs["api_key"] = self.settings.anthropic_api_key
-            self._anthropic = anthropic.Anthropic(**kwargs)
-        return self._anthropic
-
-    def _call_anthropic(self, system: str, blocks: list[dict], schema: dict, effort: str, max_tokens: int,
-                        entry: dict) -> str:
-        import anthropic
-
+        st = self.settings
         content = []
         for b in blocks:
             if b["type"] == "pdf":
-                content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                               "data": base64.b64encode(b["data"]).decode()}})
+                part = {"type": "input_file", "filename": "invoice.pdf",
+                        "file_data": "data:application/pdf;base64," + base64.b64encode(b["data"]).decode()}
+                if st.openai_pdf_detail in ("low", "high"):
+                    part["detail"] = st.openai_pdf_detail
+                content.append(part)
             else:
-                content.append({"type": "text", "text": b["text"]})
-        params = dict(
-            model=self.settings.llm_model, max_tokens=max_tokens, system=system,
-            messages=[{"role": "user", "content": content}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-        )
+                content.append({"type": "input_text", "text": b["text"]})
+        model = entry.get("model") or st.openai_model
+        level = (st.openai_reasoning or "auto").strip().lower()
+        if level == "auto":  # low for most calls, a little more for reading the PDF
+            level = {"low": "low", "medium": "low", "high": "medium"}.get(effort, "low")
+        params: dict[str, Any] = dict(
+            model=model, instructions=system, input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_schema", "name": "result", "schema": schema, "strict": True}},
+            # reasoning tokens count towards the output limit, so leave headroom
+            max_output_tokens=max(max_tokens, 16000), store=False)
+        if level != "default":
+            params["reasoning"] = {"effort": level}
+        client = self._openai_client()
         try:
             try:
-                resp = self._anthropic_client().beta.messages.create(
-                    **params, betas=["server-side-fallback-2026-07-01"], fallbacks="default")
-            except (anthropic.BadRequestError, TypeError) as e:
-                log.info("retrying without server-side fallbacks: %s", e)
-                resp = self._anthropic_client().messages.create(**params)
-        except anthropic.AuthenticationError as e:
+                resp = client.responses.create(**params)
+            except openai.BadRequestError as e:
+                if "reasoning" in params and "reasoning" in str(e).lower():
+                    log.info("model %s rejected reasoning effort %s; retrying with its default", model, level)
+                    params.pop("reasoning")
+                    resp = client.responses.create(**params)
+                else:
+                    raise
+            entry["reasoning"] = params.get("reasoning", {}).get("effort", "default")
+        except openai.AuthenticationError as e:
             entry["error"] = "Invalid API key"
-            raise LLMUnavailable("Claude authentication failed - check ANTHROPIC_API_KEY.") from e
-        except anthropic.RateLimitError as e:
-            entry["error"] = "Rate limited"
-            raise LLMUnavailable("AI rate limit reached.") from e
-        except anthropic.APIStatusError as e:
+            raise LLMUnavailable("OpenAI rejected the API key - check OPENAI_API_KEY.") from e
+        except openai.PermissionDeniedError as e:
+            entry["error"] = "API error 403"
+            raise LLMUnavailable(f"This OpenAI key has no access to model '{model}'.") from e
+        except openai.NotFoundError as e:
+            entry["error"] = "API error 404"
+            raise LLMUnavailable(f"OpenAI model '{model}' was not found - check OPENAI_MODEL.") from e
+        except openai.RateLimitError as e:
+            quota = "quota" in str(e).lower() or "insufficient" in str(e).lower()
+            entry["error"] = "Quota exhausted" if quota else "Rate limited"
+            raise LLMUnavailable("OpenAI credits / quota exhausted - check billing." if quota
+                                 else "OpenAI rate limit reached.") from e
+        except openai.APIStatusError as e:
             entry["error"] = f"API error {e.status_code}"
-            raise LLMUnavailable(f"AI service error ({e.status_code}).") from e
-        except anthropic.APIConnectionError as e:
+            raise LLMUnavailable(f"OpenAI service error ({e.status_code}).") from e
+        except openai.APIConnectionError as e:  # includes timeouts
             entry["error"] = "Connection error / timeout"
-            raise LLMUnavailable("Could not reach the AI service.") from e
+            raise LLMUnavailable("Could not reach the OpenAI service.") from e
+
         entry["served_by"] = getattr(resp, "model", None)
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            entry["input_tokens"] = getattr(usage, "input_tokens", None)
-            entry["output_tokens"] = getattr(usage, "output_tokens", None)
-        if resp.stop_reason == "refusal":
-            raise LLMUnavailable("The AI model declined the request.")
-        if resp.stop_reason == "max_tokens":
-            raise LLMUnavailable("The AI response was cut off (max_tokens).")
-        text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), None)
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            cached = getattr(getattr(u, "input_tokens_details", None), "cached_tokens", 0) or 0
+            entry["input_tokens"] = u.input_tokens
+            entry["output_tokens"] = u.output_tokens
+            entry["cached_input_tokens"] = cached
+            entry["reasoning_tokens"] = getattr(getattr(u, "output_tokens_details", None), "reasoning_tokens", None)
+            entry["cost_usd"] = round(((u.input_tokens - cached) * st.openai_price_input_per_m
+                                       + cached * st.openai_price_cached_input_per_m
+                                       + u.output_tokens * st.openai_price_output_per_m) / 1_000_000, 6)
+        if getattr(resp, "status", None) == "incomplete":
+            reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
+            if reason == "content_filter":
+                raise LLMUnavailable("OpenAI declined to answer (content filter).")
+            raise LLMUnavailable("The AI response was cut off (max output tokens).")
+        for item in getattr(resp, "output", None) or []:
+            for part in getattr(item, "content", None) or []:
+                if getattr(part, "type", None) == "refusal":
+                    raise LLMUnavailable("The AI model declined the request.")
+        text = resp.output_text
         if not text:
             raise LLMUnavailable("The AI returned no text.")
         return text

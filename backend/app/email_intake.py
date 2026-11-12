@@ -21,12 +21,14 @@ from .audit import log
 from .config import get_settings
 from .db import SessionLocal
 from .extraction.pdf_reader import DocumentError
+from .image_to_pdf import IMAGE_EXTENSIONS, IMAGE_TYPES
 from .ingestion import ingest
 from .jobs import process_many
 
 log_ = logging.getLogger(__name__)
 
-STATUS: dict = {"enabled": False, "last_poll": None, "last_error": None, "messages_seen": 0, "invoices_created": 0}
+MIN_INVOICE_IMAGE_BYTES = 20_000
+STATUS: dict ={"enabled": False, "last_poll": None, "last_error": None, "messages_seen": 0, "invoices_created": 0}
 _poll_lock = threading.Lock()
 
 
@@ -40,13 +42,20 @@ def _decode(value: str | None) -> str:
 
 
 def pdf_attachments(msg: Message) -> list[tuple[str, bytes]]:
-    """(filename, bytes) of every PDF attachment. A PDF is recognised by type, extension or %PDF header."""
+    """(filename, bytes) of every invoice attachment: PDFs (by type, extension or %PDF header) and
+    image attachments (photos / scans), which ingestion converts to PDF. Inline images without a
+    filename (logos, signatures) are ignored."""
     out = []
     for part in msg.walk():
         if part.is_multipart():
             continue
         name = _decode(part.get_filename()) or ""
         ctype = part.get_content_type()
+        if name and (ctype in IMAGE_TYPES or name.lower().endswith(IMAGE_EXTENSIONS)):
+            data = part.get_payload(decode=True) or b""
+            if len(data) >= MIN_INVOICE_IMAGE_BYTES:  # smaller ones are logos / signatures, not invoices
+                out.append((name, data))
+            continue
         if ctype not in ("application/pdf", "application/x-pdf", "application/octet-stream") \
                 and not name.lower().endswith(".pdf"):
             continue

@@ -1,4 +1,4 @@
-"""Single hard-coded reviewer account with signed bearer tokens (HMAC-SHA256)."""
+"""Two configured accounts (AP reviewer, AP manager) with signed bearer tokens (HMAC-SHA256)."""
 from __future__ import annotations
 
 import base64
@@ -43,7 +43,27 @@ def verify_token(token: str) -> str | None:
 
 def check_credentials(username: str, password: str) -> bool:
     s = get_settings()
-    return hmac.compare_digest(username, s.reviewer_username) and hmac.compare_digest(password, s.reviewer_password)
+    ok = hmac.compare_digest(username, s.reviewer_username) and hmac.compare_digest(password, s.reviewer_password)
+    if s.manager_password:
+        ok |= hmac.compare_digest(username, s.manager_username) and hmac.compare_digest(password, s.manager_password)
+    return ok
+
+
+def user_role(username: str) -> str:
+    s = get_settings()
+    return "MANAGER" if s.manager_password and username == s.manager_username else "REVIEWER"
+
+
+def user_info(username: str, profile=None) -> dict:
+    """`profile` is the user's saved UserProfile row (name / designation / photo they chose), if any."""
+    s = get_settings()
+    role = user_role(username)
+    default_name = s.manager_display_name if role == "MANAGER" else s.reviewer_display_name
+    return {"username": username, "role": role,
+            "name": (profile.display_name if profile and profile.display_name else default_name),
+            "designation": (profile.designation if profile and profile.designation
+                            else "Accounts Payable Manager" if role == "MANAGER" else "Accounts Payable"),
+            "avatar": profile.avatar if profile else None}
 
 
 def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:

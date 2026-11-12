@@ -2,7 +2,8 @@ import { FIELD_LABELS, MONEY_FIELDS, dateOnly, money, num } from "../../format";
 import { Card, Confidence, Empty, Note, StatusChip } from "../ui";
 
 const ORDER = ["vendor_name", "vendor_tax_id", "invoice_number", "invoice_date", "due_date", "po_number", "currency",
-  "subtotal", "taxable_amount", "discount", "tax_amount", "shipping", "grand_total", "vendor_address"];
+  "subtotal", "taxable_amount", "discount", "tax_amount", "shipping", "grand_total", "vendor_address",
+  "document_type", "original_invoice_number", "bank_account", "bank_ifsc", "irn"];
 
 export default function ExtractionPanel({ run }: { run: any }) {
   const ex = run.extraction;

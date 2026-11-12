@@ -31,6 +31,11 @@ class Vendor(Base):
     address: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default="APPROVED")  # APPROVED | BLOCKED | PENDING
     default_currency: Mapped[str] = mapped_column(String(3), default="INR")
+    # Payment / compliance master data
+    bank_account: Mapped[str | None] = mapped_column(String(40))       # account no. or IBAN, no spaces
+    bank_ifsc: Mapped[str | None] = mapped_column(String(16))          # IFSC (India) / SWIFT / routing no.
+    einvoice_required: Mapped[bool | None] = mapped_column(Boolean, default=False)  # GST e-invoicing (IRN + QR)
+    tds_section: Mapped[str | None] = mapped_column(String(8))         # 194C | 194J | 194I | 194Q | None
     purchase_orders: Mapped[list[PurchaseOrder]] = relationship(back_populates="vendor")
 
 
@@ -108,6 +113,15 @@ class Invoice(Base):
     grand_total: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
     po_reference: Mapped[str | None] = mapped_column(String(40))
     content_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    document_type: Mapped[str | None] = mapped_column(String(16), default="INVOICE")  # INVOICE | CREDIT_NOTE | DEBIT_NOTE
+    original_invoice_id: Mapped[int | None] = mapped_column(ForeignKey("invoices.id"))  # for credit / debit notes
+    bank_account: Mapped[str | None] = mapped_column(String(40))       # bank account printed on the document
+    bank_ifsc: Mapped[str | None] = mapped_column(String(16))
+    tds_section: Mapped[str | None] = mapped_column(String(8))
+    tds_base: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
+    tds_amount: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
+    approval_level: Mapped[str | None] = mapped_column(String(8))     # AUTO | MANAGER (from the latest run)
+    risk_flags: Mapped[list | None] = mapped_column(JSON)              # fraud / control flags of the latest run
 
     # Human-review overrides carried into re-runs
     confirmed_po_id: Mapped[int | None] = mapped_column(ForeignKey("purchase_orders.id"))
@@ -121,6 +135,7 @@ class Invoice(Base):
                                                      cascade="all, delete-orphan")
     vendor: Mapped[Vendor | None] = relationship(foreign_keys=[vendor_id])
     po: Mapped[PurchaseOrder | None] = relationship(foreign_keys=[po_id])
+    original_invoice: Mapped[Invoice | None] = relationship(foreign_keys=[original_invoice_id], remote_side=[id])
 
 
 class ProcessingRun(Base):
@@ -136,6 +151,7 @@ class ProcessingRun(Base):
     matching: Mapped[dict | None] = mapped_column(JSON)
     duplicates: Mapped[dict | None] = mapped_column(JSON)
     decision: Mapped[dict | None] = mapped_column(JSON)
+    controls: Mapped[dict | None] = mapped_column(JSON)   # approval level, fraud signals, e-invoice, TDS, notes
     ai_summary: Mapped[dict | None] = mapped_column(JSON)
     llm_calls: Mapped[list | None] = mapped_column(JSON)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -188,3 +204,13 @@ class RuleOverride(Base):
     overrides: Mapped[dict] = mapped_column(JSON)
     updated_by: Mapped[str] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserProfile(Base):
+    """Display name, designation and photo a signed-in user chose for themselves (accounts come from config)."""
+    __tablename__ = "user_profiles"
+    username: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(String(80))
+    designation: Mapped[str | None] = mapped_column(String(80))
+    avatar: Mapped[str | None] = mapped_column(Text)   # small data:image/... URL, resized in the browser
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

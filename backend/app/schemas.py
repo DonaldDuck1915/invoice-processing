@@ -15,7 +15,10 @@ FieldStatus = Literal["EXTRACTED", "MISSING", "UNCERTAIN", "CORRECTED", "DERIVED
 HEADER_FIELDS = [
     "vendor_name", "vendor_tax_id", "vendor_address", "invoice_number", "invoice_date", "due_date",
     "po_number", "currency", "subtotal", "taxable_amount", "tax_amount", "discount", "shipping", "grand_total",
+    # document kind and compliance / payment details
+    "document_type", "original_invoice_number", "bank_account", "bank_ifsc", "irn",
 ]
+DOCUMENT_TYPES = ("INVOICE", "CREDIT_NOTE", "DEBIT_NOTE")
 MONEY_FIELDS = {"subtotal", "taxable_amount", "tax_amount", "discount", "shipping", "grand_total"}
 DATE_FIELDS = {"invoice_date", "due_date"}
 
@@ -110,3 +113,5 @@ class Decision(BaseModel):
     failed_checks: list[str]
     next_action: str
     flags: list[str] = Field(default_factory=list)
+    # AUTO: within the limit · REVIEW: held by the limit, any reviewer may approve · MANAGER: manager only
+    approval_level: Literal["AUTO", "REVIEW", "MANAGER"] = "AUTO"

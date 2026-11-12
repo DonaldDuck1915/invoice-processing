@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -19,21 +18,29 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "sqlite:///./invoice_ai.db"
-    # AI provider: "auto" uses Gemini if GEMINI_API_KEY is set, else Claude if ANTHROPIC_API_KEY is set.
-    llm_provider: str = "auto"            # auto | gemini | anthropic
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.6-flash"           # reads the PDF (extraction) - accuracy first
-    gemini_fast_model: str | None = "gemini-3.5-flash-lite"  # summary, recommendation, description meaning
-    gemini_fallback_model: str | None = None  # tried when the first model is overloaded; empty = the other model
-    gemini_thinking: str = "auto"         # auto | low | medium | high | default (model's own setting)
-    anthropic_api_key: str | None = None
-    llm_model: str = "claude-opus-5-5"    # Claude model id
+    # AI (OpenAI). Without a key the app runs rules-only.
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-6-luna"      # reads the PDF (extraction)
+    openai_fast_model: str | None = None  # summary, recommendation, description meaning; empty = OPENAI_MODEL
+    openai_fallback_model: str | None = None  # tried when the first model is overloaded / times out
+    openai_reasoning: str = "auto"        # auto | none | minimal | low | medium | high | default
+    openai_pdf_detail: str = "auto"       # auto | low | high - how PDF pages are rendered (low = fewer tokens)
+    openai_base_url: str | None = None    # only for an OpenAI-compatible proxy / Azure endpoint
+    # USD per 1M tokens, used to show the cost of each run (gpt-6-luna list prices; adjust if they change)
+    openai_price_input_per_m: float = 0.10
+    openai_price_cached_input_per_m: float = 0.01
+    openai_price_output_per_m: float = 0.50
     llm_enabled: bool = True
     llm_timeout_seconds: float = 60.0     # a slow AI call falls back to rules-only instead of stalling a run
 
     reviewer_username: str = "reviewer"
     reviewer_password: str = "review123"
     reviewer_display_name: str = "AP Reviewer"
+    # Second account with the MANAGER role: the only one allowed to approve invoices above the
+    # auto-approval limit. Leave MANAGER_PASSWORD empty to disable it.
+    manager_username: str = "manager"
+    manager_password: str = "manage123"
+    manager_display_name: str = "AP Manager"
     auth_secret: str = "change-me-in-production"
     token_ttl_hours: int = 12
 
@@ -65,26 +72,18 @@ class Settings(BaseSettings):
             out.append("AUTH_SECRET")
         if self.reviewer_password == "review123":
             out.append("REVIEWER_PASSWORD")
+        if self.manager_password == "manage123":
+            out.append("MANAGER_PASSWORD")
         return out
 
     @property
     def ai_provider(self) -> str | None:
-        """Which provider is active, or None when AI is off / unconfigured."""
-        if not self.llm_enabled:
-            return None
-        gem = bool((self.gemini_api_key or "").strip())
-        ant = bool((self.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY") or "").strip())
-        pref = (self.llm_provider or "auto").strip().lower()
-        if pref in ("gemini", "google"):
-            return "gemini" if gem else None
-        if pref in ("anthropic", "claude"):
-            return "anthropic" if ant else None
-        return "gemini" if gem else ("anthropic" if ant else None)
+        """"openai" when AI is enabled and a key is set, else None (rules-only)."""
+        return "openai" if self.llm_enabled and (self.openai_api_key or "").strip() else None
 
     @property
     def ai_model(self) -> str | None:
-        p = self.ai_provider
-        return self.gemini_model if p == "gemini" else (self.llm_model if p == "anthropic" else None)
+        return self.openai_model if self.ai_provider else None
 
     @property
     def llm_available(self) -> bool:

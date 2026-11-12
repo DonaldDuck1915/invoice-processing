@@ -1,7 +1,9 @@
+import { Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
-import { Card, ErrorBox, Spinner, StatusChip } from "../components/ui";
+import NewPurchaseOrder from "../components/NewPurchaseOrder";
+import { Card, ErrorBox, Note, Spinner, StatusChip } from "../components/ui";
 import { dateTime, money, num } from "../format";
 
 export default function PurchaseOrders() {
@@ -9,16 +11,31 @@ export default function PurchaseOrders() {
   const [error, setError] = useState<unknown>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
-  useEffect(() => { api.get("/purchase-orders").then(setPos).catch(setError); }, []);
+  const [adding, setAdding] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const load = () => api.get("/purchase-orders").then(setPos).catch(setError);
+  useEffect(() => { load(); }, []);
   useEffect(() => { setDetail(null); if (open) api.get(`/purchase-orders/${open}`).then(setDetail).catch(setError); }, [open]);
   if (error) return <ErrorBox error={error} />;
   if (!pos) return <Spinner label="Loading purchase orders..." />;
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-xl font-semibold text-slate-900">Purchase orders</h1>
-        <p className="text-sm text-slate-500">Consumption is derived from the ledger of approved invoices (each invoice counted once per PO line).</p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-slate-900">Purchase orders</h1>
+          <p className="text-sm text-slate-500">Consumption is derived from the ledger of approved invoices (each invoice counted once per PO line).</p>
+        </div>
+        {!adding && <button className="btn-primary" onClick={() => { setAdding(true); setNotice(null); }}><Plus className="h-4 w-4" />New purchase order</button>}
       </div>
+      {notice && <Note>{notice}</Note>}
+      {adding && (
+        <NewPurchaseOrder onCancel={() => setAdding(false)} onCreated={(po) => {
+          setAdding(false);
+          setNotice(`${po.po_number} created (${money(po.subtotal, po.currency)} net). Invoices waiting for a PO can be re-run to match it.`);
+          load();
+          setOpen(po.po_number);
+        }} />
+      )}
       <div className="card overflow-x-auto">
         <table className="w-full">
           <thead><tr><th className="th">PO</th><th className="th">Vendor</th><th className="th">Description</th><th className="th">Status</th><th className="th num">Net value</th><th className="th" style={{ width: 220 }}>Consumed</th><th className="th num">Remaining</th></tr></thead>

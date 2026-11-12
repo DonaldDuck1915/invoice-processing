@@ -1,4 +1,4 @@
-"""Demo procurement data: 9 vendors, 15 purchase orders. Shared by the seeder and the
+"""Demo procurement data: 10 vendors, 19 purchase orders. Shared by the seeder and the
 sample-invoice generator so both always agree."""
 
 COMPANY = {"name": "Acme Manufacturing Pvt Ltd", "gstin": "27AABCM1234F1ZX",
@@ -6,23 +6,33 @@ COMPANY = {"name": "Acme Manufacturing Pvt Ltd", "gstin": "27AABCM1234F1ZX",
 
 VENDORS = [
     {"code": "V001", "name": "Ergo Seating Solutions Pvt Ltd", "tax_id": "27AAECE4521K1ZN", "country": "IN",
-     "status": "APPROVED", "default_currency": "INR", "address": "22 Bhosari MIDC, Pune, Maharashtra 411026"},
+     "status": "APPROVED", "default_currency": "INR", "address": "22 Bhosari MIDC, Pune, Maharashtra 411026",
+     "bank_account": "50200012345671", "bank_ifsc": "HDFC0001234", "tds_section": "194Q"},
     {"code": "V002", "name": "Nimbus Office Equipment LLP", "tax_id": "29AAFCN7788L1ZG", "country": "IN",
-     "status": "APPROVED", "default_currency": "INR", "address": "5th Cross, Peenya Industrial Area, Bengaluru 560058"},
+     "status": "APPROVED", "default_currency": "INR", "address": "5th Cross, Peenya Industrial Area, Bengaluru 560058",
+     "bank_account": "1234567890123", "bank_ifsc": "ICIC0000456"},
     {"code": "V003", "name": "Prime Workspace Interiors", "tax_id": "27AAGFP3311M1Z6", "country": "IN",
-     "status": "APPROVED", "default_currency": "INR", "address": "Office 301, Baner Road, Pune 411045"},
+     "status": "APPROVED", "default_currency": "INR", "address": "Office 301, Baner Road, Pune 411045",
+     "bank_account": "39012345678", "bank_ifsc": "SBIN0001122"},
     {"code": "V004", "name": "TechNova Computer Accessories", "tax_id": "07AAKCT9087N1ZB", "country": "IN",
-     "status": "APPROVED", "default_currency": "INR", "address": "B-12 Nehru Place, New Delhi 110019"},
+     "status": "APPROVED", "default_currency": "INR", "address": "B-12 Nehru Place, New Delhi 110019",
+     "bank_account": "918020012345678", "bank_ifsc": "UTIB0000123", "tds_section": "194Q"},
     {"code": "V005", "name": "Rhine Industrial GmbH", "tax_id": "DE811569869", "country": "DE",
-     "status": "APPROVED", "default_currency": "EUR", "address": "Industriestrasse 8, 40210 Duesseldorf, Germany"},
+     "status": "APPROVED", "default_currency": "EUR", "address": "Industriestrasse 8, 40210 Duesseldorf, Germany",
+     "bank_account": "DE89370400440532013000", "bank_ifsc": "COBADEFFXXX"},
     {"code": "V006", "name": "Atlas Safety Supply Co.", "tax_id": "84-3920517", "country": "US",
      "status": "APPROVED", "default_currency": "USD", "address": "1400 Commerce Dr, Houston, TX 77002, USA"},
     {"code": "V007", "name": "QuickPrint Stationers", "tax_id": "27AAQPQ2210P1Z8", "country": "IN",
      "status": "BLOCKED", "default_currency": "INR", "address": "Shop 4, Laxmi Road, Pune 411030"},
     {"code": "V008", "name": "GreenLeaf Facility Services", "tax_id": "27AABFG6543Q1ZW", "country": "IN",
-     "status": "APPROVED", "default_currency": "INR", "address": "Kalyani Nagar, Pune 411006"},
+     "status": "APPROVED", "default_currency": "INR", "address": "Kalyani Nagar, Pune 411006",
+     "bank_account": "60123456789", "bank_ifsc": "KKBK0000654", "tds_section": "194C"},
     {"code": "V009", "name": "Sunrise Catering Services", "tax_id": "29AAXCS1188R1ZZ", "country": "IN",
-     "status": "PENDING", "default_currency": "INR", "address": "HSR Layout, Bengaluru 560102"},
+     "status": "PENDING", "default_currency": "INR", "address": "HSR Layout, Bengaluru 560102",
+     "tds_section": "194C"},
+    {"code": "V010", "name": "Kaveri Electricals Pvt Ltd", "tax_id": "27AAKCK5520M1Z6", "country": "IN",
+     "status": "APPROVED", "default_currency": "INR", "address": "Plot 7, Chakan MIDC, Pune 410501",
+     "bank_account": "00451100012345", "bank_ifsc": "BARB0CHAKAN", "einvoice_required": True, "tds_section": "194C"},
 ]
 
 # lines: (item_code, description, uom, quantity, unit_price, tax_rate)
@@ -77,6 +87,22 @@ PURCHASE_ORDERS = [
     {"po_number": "PO-2012", "vendor": "V009", "po_date": "2026-10-01", "status": "APPROVED", "currency": "INR",
      "description": "Canteen catering October",
      "lines": [("CAT-OCT", "Employee canteen catering - October", "MONTH", "1", "85000", "5")]},
+]
+
+PURCHASE_ORDERS += [
+    {"po_number": "PO-2013", "vendor": "V010", "po_date": "2026-09-28", "status": "APPROVED", "currency": "INR",
+     "description": "Electrical installation - Pune plant (e-invoiced vendor)",
+     "lines": [("EL-PNL-400", "LT distribution panel 400A", "NOS", "3", "85000", "18"),
+               ("EL-CBL-95", "Armoured copper cable 95 sq mm", "MTR", "500", "950", "18")]},
+    {"po_number": "PO-2014", "vendor": "V002", "po_date": "2026-10-05", "status": "APPROVED", "currency": "INR",
+     "description": "A3 multifunction printers (above approval limit)",
+     "lines": [("MFP-A3-60", "A3 multifunction printer 60 ppm", "NOS", "6", "78000", "18")]},
+    {"po_number": "PO-2015", "vendor": "V002", "po_date": "2026-10-08", "status": "APPROVED", "currency": "INR",
+     "description": "Laptops for sales team",
+     "lines": [("LT-14-I7", "14-inch business laptop i7 16GB", "NOS", "20", "40500", "18")]},
+    {"po_number": "PO-2016", "vendor": "V004", "po_date": "2026-10-12", "status": "APPROVED", "currency": "INR",
+     "description": "Webcams for meeting rooms",
+     "lines": [("WC-4K", "4K conference webcam", "NOS", "8", "4500", "18")]},
 ]
 
 # PO-2004 is CLOSED and fully consumed by a historical invoice

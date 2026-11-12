@@ -1,7 +1,10 @@
-import { FileText, LayoutDashboard, LogOut, Package, Settings as SettingsIcon, Upload as UploadIcon, Users } from "lucide-react";
+import { ChevronsLeft, ChevronsRight, FileText, LayoutDashboard, LogOut, Package, Pencil, Settings as SettingsIcon, Upload as UploadIcon, Users } from "lucide-react";
 import { ReactNode, useEffect, useState } from "react";
+import { HiOutlineDocumentSearch } from "react-icons/hi";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { api, auth } from "./api";
+import Modal from "./components/Modal";
+import { Avatar, ProfileDialog, User } from "./components/Profile";
 import Dashboard from "./pages/Dashboard";
 import InvoiceDetail from "./pages/InvoiceDetail";
 import Invoices from "./pages/Invoices";
@@ -20,51 +23,129 @@ const NAV = [
   { to: "/settings", label: "Rules & data", icon: SettingsIcon },
 ];
 
-function Shell({ children, user, onLogout }: { children: ReactNode; user: any; onLogout: () => void }) {
-  const [health, setHealth] = useState<any>(null);
-  useEffect(() => { api.get("/health").then(setHealth).catch(() => setHealth(null)); }, []);
+const WIDTH_KEY = "invoice-ai-sidebar-width";
+const COLLAPSED_KEY = "invoice-ai-sidebar-collapsed";
+const MIN_W = 200, MAX_W = 360, DEFAULT_W = 248, COLLAPSED_W = 76;
+
+const stored = (key: string, fallback: string) => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } };
+const store = (key: string, value: string) => { try { localStorage.setItem(key, value); } catch { /* private mode */ } };
+
+function Shell({ children, user, onLogout, onUser }: { children: ReactNode; user: User; onLogout: () => void; onUser: (u: User) => void }) {
+  const [width, setWidth] = useState(() => Math.min(MAX_W, Math.max(MIN_W, Number(stored(WIDTH_KEY, String(DEFAULT_W))) || DEFAULT_W)));
+  const [collapsed, setCollapsed] = useState(() => stored(COLLAPSED_KEY, "0") === "1");
+  const [dragging, setDragging] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [confirmLogout, setConfirmLogout] = useState(false);
+  useEffect(() => store(WIDTH_KEY, String(width)), [width]);
+  useEffect(() => store(COLLAPSED_KEY, collapsed ? "1" : "0"), [collapsed]);
+
+  // Drag the sidebar's right edge to resize it; dragging it narrow enough collapses it to icons.
+  useEffect(() => {
+    if (!dragging) return;
+    const move = (e: MouseEvent) => {
+      if (e.clientX < 140) { setCollapsed(true); return; }
+      setCollapsed(false);
+      setWidth(Math.min(MAX_W, Math.max(MIN_W, e.clientX)));
+    };
+    const up = () => setDragging(false);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [dragging]);
+
   return (
-    <div className="min-h-screen flex">
-      <aside className="hidden md:flex w-60 shrink-0 flex-col bg-slate-900 text-slate-300">
-        <div className="px-5 py-5 flex items-center gap-2.5">
-          <div className="h-8 w-8 rounded-lg bg-indigo-500 flex items-center justify-center text-white"><FileText className="h-4 w-4" /></div>
-          <div>
-            <div className="text-sm font-semibold text-white">Invoice AI</div>
-            <div className="text-[11px] text-slate-400">AP · PO matching</div>
-          </div>
+    <div className="h-[100dvh] flex flex-col md:flex-row overflow-hidden">
+      <aside style={{ width: collapsed ? COLLAPSED_W : width }}
+        className={`relative hidden md:flex shrink-0 flex-col bg-slate-900 text-slate-300 ${dragging ? "" : "transition-[width] duration-200"}`}>
+        {/* brand */}
+        <div className={`shrink-0 flex items-center gap-2.5 py-5 ${collapsed ? "justify-center" : "px-5"}`}>
+          <div className="h-8 w-8 shrink-0 rounded-lg bg-indigo-500 flex items-center justify-center text-white"><HiOutlineDocumentSearch className="h-5 w-5" /></div>
+          {!collapsed && (
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-white truncate">Invoice AI</div>
+              <div className="text-[11px] text-slate-400 truncate">AP · PO matching</div>
+            </div>
+          )}
         </div>
-        <nav className="flex-1 px-3 space-y-0.5">
+        <button onClick={() => setCollapsed((c) => !c)} title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          className="absolute -right-3 top-6 z-20 h-6 w-6 rounded-full bg-slate-800 border border-slate-700 text-slate-300 hover:text-white hover:bg-indigo-600 flex items-center justify-center shadow">
+          {collapsed ? <ChevronsRight className="h-3.5 w-3.5" /> : <ChevronsLeft className="h-3.5 w-3.5" />}
+        </button>
+
+        {/* navigation scrolls on its own */}
+        <nav className="sidebar-scroll flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 space-y-0.5">
           {NAV.map(({ to, label, icon: Icon, end }) => (
-            <NavLink key={to} to={to} end={end}
-              className={({ isActive }) => `flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition ${isActive ? "bg-slate-800 text-white" : "hover:bg-slate-800/60 hover:text-white"}`}>
-              <Icon className="h-4 w-4" />{label}
+            <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined}
+              className={({ isActive }) => `flex items-center gap-2.5 rounded-lg py-2 text-sm transition ${collapsed ? "justify-center" : "px-3"} ${isActive ? "bg-slate-800 text-white" : "hover:bg-slate-800/60 hover:text-white"}`}>
+              <Icon className="h-4 w-4 shrink-0" />{!collapsed && <span className="truncate">{label}</span>}
             </NavLink>
           ))}
         </nav>
-        <div className="px-5 py-4 text-[11px] space-y-1 border-t border-slate-800">
-          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.ocr_available ? "bg-emerald-400" : "bg-slate-500"}`} />OCR {health?.ocr_available ? "ready" : "unavailable"}</div>
-          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.ai_configured ? "bg-emerald-400" : "bg-amber-400"}`} />AI {health?.ai_configured ? `enabled · ${health.ai_provider === "gemini" ? "Gemini" : "Claude"}` : "not configured (rules only)"}</div>
-          <div className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${health?.email_intake ? "bg-emerald-400" : "bg-slate-500"}`} />E-mail intake {health?.email_intake ? "on" : "off"}</div>
-          {health?.insecure_defaults?.length > 0 && <div className="text-amber-300" title="Change these before sharing this instance">Demo {health.insecure_defaults.join(" & ").toLowerCase().replace(/_/g, " ")}</div>}
+
+        {/* profile: always on screen at the bottom of the sidebar */}
+        <div className="shrink-0 border-t border-slate-800 p-3">
+          <div className={`flex items-center gap-1 ${collapsed ? "flex-col" : ""}`}>
+            <button onClick={() => setEditing(true)} title="Edit profile"
+              className={`group flex min-w-0 flex-1 items-center gap-3 rounded-xl p-2 text-left transition hover:bg-slate-800 ${collapsed ? "justify-center" : ""}`}>
+              <Avatar user={user} />
+              {!collapsed && (
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-white truncate">{user.name}</span>
+                  <span className="block text-[11px] text-indigo-300 truncate">{user.designation}</span>
+                </span>
+              )}
+              {!collapsed && <Pencil className="h-3.5 w-3.5 shrink-0 text-slate-500 opacity-0 transition group-hover:opacity-100" />}
+            </button>
+            <button onClick={() => setConfirmLogout(true)} title="Sign out"
+              className="shrink-0 rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"><LogOut className="h-4 w-4" /></button>
+          </div>
         </div>
-        <div className="px-5 py-4 border-t border-slate-800 flex items-center justify-between">
-          <div className="text-xs"><div className="text-white font-medium">{user?.name}</div><div className="text-slate-400">{user?.username}</div></div>
-          <button onClick={onLogout} className="text-slate-400 hover:text-white" title="Sign out"><LogOut className="h-4 w-4" /></button>
-        </div>
+
+        {/* resize handle */}
+        <div onMouseDown={(e) => { e.preventDefault(); setDragging(true); }} onDoubleClick={() => { setCollapsed(false); setWidth(DEFAULT_W); }}
+          title="Drag to resize · double-click to reset"
+          className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize transition ${dragging ? "bg-indigo-500/60" : "hover:bg-indigo-500/40"}`} />
       </aside>
-      <div className="flex-1 min-w-0">
-        <div className="md:hidden flex items-center justify-between bg-slate-900 text-white px-4 py-3">
-          <span className="font-semibold text-sm">Invoice AI</span>
-          <div className="flex gap-3 text-xs">{NAV.slice(0, 3).map((n) => <NavLink key={n.to} to={n.to} end={n.end}>{n.label.split(" ")[0]}</NavLink>)}</div>
+
+      <div className="md:hidden shrink-0 flex items-center justify-between bg-slate-900 text-white px-4 py-3">
+        <span className="font-semibold text-sm flex items-center gap-2"><HiOutlineDocumentSearch className="h-5 w-5 text-indigo-300" />Invoice AI</span>
+        <div className="flex items-center gap-3 text-xs">
+          {NAV.slice(0, 3).map((n) => <NavLink key={n.to} to={n.to} end={n.end}>{n.label.split(" ")[0]}</NavLink>)}
+          <button onClick={() => setEditing(true)} title="Edit profile"><Avatar user={user} size="h-7 w-7" text="text-[10px]" /></button>
+          <button onClick={() => setConfirmLogout(true)} title="Sign out"><LogOut className="h-4 w-4" /></button>
         </div>
+      </div>
+
+      {/* the page scrolls on its own, independent of the sidebar */}
+      <div className="flex-1 min-w-0 min-h-0 overflow-y-auto overscroll-contain">
         <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-6">{children}</main>
       </div>
+
+      {editing && <ProfileDialog user={user} onClose={() => setEditing(false)} onSaved={onUser} />}
+      {confirmLogout && (
+        <Modal title="Sign out?" onClose={() => setConfirmLogout(false)} width="max-w-sm">
+          <p className="text-sm text-slate-600">You will need to sign in again to review invoices.</p>
+          <div className="mt-5 flex justify-end gap-2">
+            <button className="btn-secondary" onClick={() => setConfirmLogout(false)} autoFocus>Cancel</button>
+            <button className="btn bg-rose-600 text-white hover:bg-rose-700" onClick={() => { setConfirmLogout(false); onLogout(); }}>
+              <LogOut className="h-4 w-4" />Sign out
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
 
 export default function App() {
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
   const location = useLocation();
 
@@ -83,7 +164,7 @@ export default function App() {
   }
   const logout = () => { auth.set(null); setUser(null); };
   return (
-    <Shell user={user} onLogout={logout}>
+    <Shell user={user} onLogout={logout} onUser={setUser}>
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/upload" element={<Upload />} />
