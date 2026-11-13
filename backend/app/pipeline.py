@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import traceback
 from datetime import date, datetime, timezone
 
@@ -45,24 +46,58 @@ _LEDGER_LOCK = threading.RLock()
 _PG_LOCK_KEY = 74_240_001
 
 
+class LedgerBusy(Exception):
+    pass
+
+
 class LedgerSection:
-    """Process-wide lock, plus a Postgres advisory lock so several API workers also serialise."""
+    """Process-wide lock, plus a Postgres advisory lock so several API workers also serialise.
+
+    The advisory lock lives on a dedicated connection held for the whole section. (Taking it through the
+    request's Session was a bug: the pipeline commits after every stage, which hands the Session's
+    connection back to the pool still holding the lock, and the unlock could then run on another
+    connection - leaking the lock and blocking every later invoice at the matching stage.)"""
+
+    WAIT_SECONDS = 180
 
     def __init__(self, db: Session):
         self.db = db
         self.pg = db.get_bind().dialect.name == "postgresql"
+        self.conn = None
 
     def __enter__(self):
-        _LEDGER_LOCK.acquire()
+        if not _LEDGER_LOCK.acquire(timeout=self.WAIT_SECONDS):
+            raise LedgerBusy("Another invoice has held the PO ledger for over 3 minutes; try again.")
         if self.pg:
-            self.db.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _PG_LOCK_KEY})
+            try:
+                self.conn = self.db.get_bind().connect()
+                deadline = time.monotonic() + self.WAIT_SECONDS
+                while not self.conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _PG_LOCK_KEY}).scalar():
+                    if time.monotonic() > deadline:
+                        raise LedgerBusy("Another worker has held the PO ledger for over 3 minutes; try again.")
+                    time.sleep(0.25)
+            except BaseException:
+                self._close()
+                _LEDGER_LOCK.release()
+                raise
         return self
+
+    def _close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None
 
     def __exit__(self, *exc):
         try:
-            if self.pg:
-                self.db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _PG_LOCK_KEY})
-                self.db.commit()
+            if self.conn is not None:
+                try:
+                    self.conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _PG_LOCK_KEY})
+                    self.conn.commit()
+                except Exception:  # noqa: BLE001 - never return a connection that may still hold the lock
+                    self.conn.invalidate()
+                self._close()
         finally:
             _LEDGER_LOCK.release()
 
