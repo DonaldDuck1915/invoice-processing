@@ -189,12 +189,59 @@ def apply_corrections(inv: ExtractedInvoice, corrections: dict | None) -> Extrac
     return inv
 
 
-def extract(pdf_bytes: bytes, rules: dict, llm: LLMClient, settings) -> tuple[ExtractedInvoice, DocumentText]:
+CRITICAL = ("vendor_tax_id", "invoice_number", "invoice_date", "grand_total", "currency")
+STRICT_CONFIDENCE = 0.90
+RX_BANK_HINT = re.compile(r"\b(?:a/?c\.?\s*no|account\s*(?:no|number)|iban|ifsc|swift)\b", re.I)
+RX_IRN_HINT = re.compile(r"\bIRN\b")
+RX_NOTE_HINT = re.compile(r"\b(?:credit|debit)\s*note\b", re.I)
+
+
+def ai_not_needed(rule_inv: ExtractedInvoice, doc: DocumentText, rules: dict) -> tuple[bool, str]:
+    """Strict test for skipping the AI reader. Only a clean digital invoice passes: the rule parser found
+    every critical field with high confidence AND every sum reconciles (lines, subtotal, tax, grand total),
+    so the arithmetic itself confirms the reading. Anything else gets the AI exactly as before.
+    Returns (skip, reason)."""
+    from ..extraction.parsers import tax_id_format_valid
+    from ..validation import check_grand_total, check_line_math, check_mandatory, check_subtotal, check_tax
+
+    if doc.is_scanned:
+        return False, "scanned document"
+    inv = finalize(rule_inv.model_copy(deep=True), float(rules["extraction"]["min_confidence"]))
+    for name in CRITICAL:
+        f = inv.field(name)
+        if f.value is None or f.status != "EXTRACTED" or f.confidence < STRICT_CONFIDENCE:
+            return False, f"{name.replace('_', ' ')} not read with high confidence"
+    if not tax_id_format_valid(inv.get("vendor_tax_id")):
+        return False, "vendor tax ID does not validate"
+    if not inv.line_items or any(li.status != "EXTRACTED" for li in inv.line_items):
+        return False, "line items incomplete"
+    checks = check_mandatory(inv) + check_line_math(inv, rules) + check_tax(inv, rules) + \
+        [check_subtotal(inv, rules), check_grand_total(inv, rules)]
+    bad = [c for c in checks if c.status in ("FAIL", "SKIPPED")
+           and (c.code.startswith(("V1.", "V2.", "V4.", "V5.")) or c.code == "V3.tax")]
+    if bad:
+        return False, f"{bad[0].name.lower()} does not reconcile"
+    text = doc.text or ""
+    # fields the rules read less reliably on unusual layouts: if the document mentions them, ask the AI
+    if RX_BANK_HINT.search(text) and not inv.get("bank_account"):
+        return False, "bank details printed but not read"
+    if RX_IRN_HINT.search(text) and not inv.get("irn"):
+        return False, "IRN printed but not read"
+    if RX_NOTE_HINT.search(text) and not inv.get("original_invoice_number"):
+        return False, "credit/debit note without a read original-invoice reference"
+    return True, "clean digital invoice: all critical fields read and every total reconciles"
+
+
+def extract(pdf_bytes: bytes, rules: dict, llm: LLMClient, settings,
+            force_ai: bool = False) -> tuple[ExtractedInvoice, DocumentText]:
     doc = read_document(pdf_bytes, settings.max_pages, settings.tesseract_cmd)
     company = rules.get("company", {})
     rule_inv = extract_with_rules(doc, company.get("tax_ids"), company.get("name"))
     ai, ai_error = None, None
-    if llm.available:
+    skip, skip_reason = False, None
+    if llm.available and not force_ai and getattr(settings, "ai_extraction", "auto") == "auto":
+        skip, skip_reason = ai_not_needed(rule_inv, doc, rules)
+    if llm.available and not skip:
         try:
             ai = extract_with_llm(llm, pdf_bytes, doc.text, company.get("name", "the buyer"))
         except LLMUnavailable as e:
@@ -206,5 +253,7 @@ def extract(pdf_bytes: bytes, rules: dict, llm: LLMClient, settings) -> tuple[Ex
         inv.meta["qr_codes"], inv.meta["qr_error"] = [], str(e)
     inv.meta["ai_used"] = ai is not None
     inv.meta["ai_error"] = ai_error
+    inv.meta["ai_skipped"] = skip
+    inv.meta["ai_skip_reason"] = skip_reason if skip else None
     inv.meta["warnings"] = doc.warnings
     return finalize(inv, float(rules["extraction"]["min_confidence"])), doc

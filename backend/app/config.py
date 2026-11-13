@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     openai_price_cached_input_per_m: float = 0.01
     openai_price_output_per_m: float = 0.50
     llm_enabled: bool = True
+    # auto: skip the AI reader for clean digital invoices (all critical fields read, every total
+    # reconciles); always: send every invoice to the AI reader
+    ai_extraction: str = "auto"
     llm_timeout_seconds: float = 60.0     # a slow AI call falls back to rules-only instead of stalling a run
 
     reviewer_username: str = "reviewer"

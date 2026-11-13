@@ -185,7 +185,8 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
         else:
             doc = db.get(m.Document, invoice.document_id)
             try:
-                base, doc_text = extract(doc.content, rules, llm, settings)
+                # a reviewer's "re-extract" always asks the AI, even for a clean invoice
+                base, doc_text = extract(doc.content, rules, llm, settings, force_ai=trigger == "RE_EXTRACT")
                 invoice.is_scanned = doc_text.is_scanned
                 invoice.page_count = doc_text.page_count
             except DocumentError:
@@ -202,8 +203,10 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
                 f"Extracted {counts.get('EXTRACTED', 0)} fields, {len(base.line_items)} line item(s); "
                 f"{counts.get('MISSING', 0)} missing, {counts.get('UNCERTAIN', 0)} uncertain. "
                 f"{'Scanned document (OCR)' if base.meta.get('is_scanned') else 'Digital text layer'}; "
-                f"AI extraction {'used' if base.meta.get('ai_used') else 'not used' + (' - ' + base.meta['ai_error'] if base.meta.get('ai_error') else '')}.",
+                + ("AI reader not needed - " + base.meta["ai_skip_reason"] + "." if base.meta.get("ai_skipped") else
+                   f"AI extraction {'used' if base.meta.get('ai_used') else 'not used' + (' - ' + base.meta['ai_error'] if base.meta.get('ai_error') else '')}."),
                 {"status_counts": counts, "extractor": base.meta.get("extractor"),
+                 "ai_skipped": bool(base.meta.get("ai_skipped")),
                  "ocr_mean_conf": base.meta.get("ocr_mean_conf")}, rn)
         inv = apply_corrections(base.model_copy(deep=True), invoice.corrections)
         inv = finalize(inv, float(rules["extraction"]["min_confidence"]))

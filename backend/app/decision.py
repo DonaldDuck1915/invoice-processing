@@ -169,7 +169,9 @@ def decide(inv: ExtractedInvoice, checks: list[CheckResult], vendor_res: dict, m
         flags.append("CURRENCY_ASSUMED")
     if inv.meta.get("is_scanned"):
         flags.append("SCANNED")
-    if not inv.meta.get("ai_used"):
+    if inv.meta.get("ai_skipped"):
+        flags.append("AI_NOT_NEEDED")
+    elif not inv.meta.get("ai_used"):
         flags.append("AI_NOT_USED")
 
     # ---------------------------------------------------------------- precedence
