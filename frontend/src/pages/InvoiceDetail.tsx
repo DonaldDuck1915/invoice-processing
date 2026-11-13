@@ -34,12 +34,12 @@ export default function InvoiceDetail() {
     window.clearInterval(timer.current);
     timer.current = window.setInterval(async () => {
       const n = await load();
-      if (n && !["RECEIVED", "PROCESSING"].includes(n.invoice.status)) window.clearInterval(timer.current);
+      if (n && !["RECEIVED", "PROCESSING"].includes(n.invoice.status) && n.invoice.stage !== "SUMMARISING") window.clearInterval(timer.current);
     }, 1500);
   }, [load]);
 
   useEffect(() => {
-    load().then((d) => { if (d && ["RECEIVED", "PROCESSING"].includes(d.invoice.status)) watch(); });
+    load().then((d) => { if (d && (["RECEIVED", "PROCESSING"].includes(d.invoice.status) || d.invoice.stage === "SUMMARISING")) watch(); });
     let url: string | null = null;
     api.blob(`/invoices/${id}/file`).then((b) => { url = URL.createObjectURL(b); setPdfUrl(url); }).catch(() => {});
     return () => { window.clearInterval(timer.current); if (url) URL.revokeObjectURL(url); };

@@ -12,6 +12,8 @@ import base64
 import hashlib
 import json
 import logging
+import random
+import threading
 import time
 from typing import Any
 
@@ -24,6 +26,72 @@ AI_DISCLAIMER = "AI and can make mistakes. Please double-check responses."
 
 class LLMUnavailable(Exception):
     pass
+
+
+# --------------------------------------------------------------------------- shared limits (whole process)
+# Invoices are read in parallel, so OpenAI requests from many invoices can be in flight together. These
+# limits are process-wide: a cap on simultaneous requests, and optional pacing to the account's RPM.
+_sleep = time.sleep          # patched in tests
+_limits_lock = threading.Lock()
+_slots: threading.BoundedSemaphore | None = None
+_slots_size = 0
+_next_request_at = 0.0
+
+
+def _api_slots() -> threading.BoundedSemaphore:
+    global _slots, _slots_size
+    size = max(1, get_settings().openai_max_concurrency)
+    with _limits_lock:
+        if _slots is None or _slots_size != size:
+            _slots, _slots_size = threading.BoundedSemaphore(size), size
+        return _slots
+
+
+def _pace() -> None:
+    """Spread requests evenly when OPENAI_REQUESTS_PER_MINUTE is set (0 = no client-side pacing)."""
+    global _next_request_at
+    rpm = get_settings().openai_requests_per_minute
+    if rpm <= 0:
+        return
+    with _limits_lock:
+        now = time.monotonic()
+        start = max(now, _next_request_at)
+        _next_request_at = start + 60.0 / rpm
+    if start > now:
+        _sleep(start - now)
+
+
+def _retryable(error: str, fallback_left: bool) -> bool:
+    """Worth waiting and trying the SAME model again?
+    - rate limited (not out of credits): yes - another model shares the account's limits anyway
+    - 500/502/503/529 (server error, overloaded): only when there is no fallback model left to switch to
+    - 504 / timeouts / connection errors: no - that would mean waiting out a whole timeout again"""
+    if error == "Rate limited":
+        return True
+    if error.startswith("API error 5") and error != "API error 504":
+        return not fallback_left
+    return False
+
+
+def _backoff(attempt: int, retry_after: float | None) -> float:
+    st = get_settings()
+    wait = min(20.0, st.openai_backoff_seconds * (2 ** attempt)) + random.uniform(0, st.openai_backoff_seconds)
+    if retry_after:
+        wait = max(wait, retry_after)
+    return min(wait, 20.0)
+
+
+def _retry_after(exc) -> float | None:
+    """Seconds the API asked us to wait (Retry-After / retry-after-ms headers), if any."""
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    try:
+        if headers.get("retry-after-ms"):
+            return float(headers["retry-after-ms"]) / 1000
+        if headers.get("retry-after"):
+            return float(headers["retry-after"])
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def pdf_block(data: bytes) -> dict:
@@ -98,26 +166,48 @@ class LLMClient:
             self.calls.append({"purpose": purpose, "cached": True, "ok": True, "provider": self.provider})
             return self._cache[key]
         last: LLMUnavailable | None = None
-        for model in self.models_for(purpose):
+        models = self.models_for(purpose)
+        for idx, model in enumerate(models):
+            fallback_left = any(m not in self._down for m in models[idx + 1:])
             if model in self._down:
                 self.calls.append({"purpose": purpose, "provider": self.provider, "model": model, "ok": False,
                                    "error": f"skipped - {self._down[model]} earlier in this run", "latency_ms": 0})
                 last = LLMUnavailable(f"{model} was unavailable earlier in this run ({self._down[model]}).")
                 continue
-            try:
-                return self._attempt(purpose, model, system, user_content, schema, effort, max_tokens, key)
-            except LLMUnavailable as e:
-                last = e
-                err = str(self.calls[-1].get("error") or e)
-                if not self._transient(err):
-                    raise  # bad key, quota, refusal, malformed output: another model will not help
-                self._down[model] = err
+            retries = max(0, self.settings.openai_max_retries)
+            for attempt in range(retries + 1):
+                try:
+                    return self._attempt(purpose, model, system, user_content, schema, effort, max_tokens, key,
+                                         attempt)
+                except LLMUnavailable as e:
+                    last = e
+                    entry = self.calls[-1]
+                    err = str(entry.get("error") or e)
+                    if _retryable(err, fallback_left) and attempt < retries:
+                        wait = _backoff(attempt, entry.get("retry_after_s"))
+                        entry["retry_in_s"] = round(wait, 2)
+                        log.info("%s: %s on %s - retry %d/%d in %.1fs", purpose, err, model, attempt + 1, retries, wait)
+                        _sleep(wait)
+                        continue
+                    break
+            err = str(self.calls[-1].get("error") or last)
+            if not self._transient(err):
+                raise last  # bad key, quota, refusal, malformed output, rate limit after retries
+            self._down[model] = err  # overloaded / unreachable: try the fallback model, if any
         raise last or LLMUnavailable("No AI model is available.")
 
     def _attempt(self, purpose: str, model: str, system: str, user_content: list[dict], schema: dict,
-                 effort: str, max_tokens: int, key: str) -> dict:
-        t0 = time.time()
+                 effort: str, max_tokens: int, key: str, attempt: int = 0) -> dict:
         entry: dict[str, Any] = {"purpose": purpose, "provider": self.provider, "model": model, "ok": False}
+        if attempt:
+            entry["attempt"] = attempt + 1
+        _pace()
+        slots = _api_slots()
+        waited = time.time()
+        slots.acquire()                      # at most OPENAI_MAX_CONCURRENCY requests in flight
+        t0 = time.time()
+        if t0 - waited > 0.05:
+            entry["queued_ms"] = int((t0 - waited) * 1000)
         try:
             text = self._call_openai(system, user_content, schema, max_tokens, entry, effort)
             try:
@@ -132,6 +222,7 @@ class LLMClient:
             entry.setdefault("error", str(e))
             raise
         finally:
+            slots.release()
             entry["latency_ms"] = int((time.time() - t0) * 1000)
             self.calls.append(entry)
 
@@ -140,7 +231,8 @@ class LLMClient:
         if self._openai is None:
             import openai
 
-            # no SDK retries: an overloaded model is handled by the fallback model instead of waiting again
+            # no SDK retries: json_call retries rate limits / 5xx itself (with back-off, inside the shared
+            # concurrency cap) and moves to the fallback model when a model stays overloaded
             self._openai = openai.OpenAI(api_key=self.settings.openai_api_key, base_url=self.settings.openai_base_url,
                                          timeout=self.settings.llm_timeout_seconds, max_retries=0)
         return self._openai
@@ -196,10 +288,12 @@ class LLMClient:
         except openai.RateLimitError as e:
             quota = "quota" in str(e).lower() or "insufficient" in str(e).lower()
             entry["error"] = "Quota exhausted" if quota else "Rate limited"
+            entry["retry_after_s"] = _retry_after(e)
             raise LLMUnavailable("OpenAI credits / quota exhausted - check billing." if quota
                                  else "OpenAI rate limit reached.") from e
         except openai.APIStatusError as e:
             entry["error"] = f"API error {e.status_code}"
+            entry["retry_after_s"] = _retry_after(e)
             raise LLMUnavailable(f"OpenAI service error ({e.status_code}).") from e
         except openai.APIConnectionError as e:  # includes timeouts
             entry["error"] = "Connection error / timeout"

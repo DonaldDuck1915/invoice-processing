@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from sqlalchemy import select, text
@@ -159,8 +160,47 @@ def _history(db: Session, invoice: m.Invoice) -> list[dict]:
     return out
 
 
+@dataclass
+class ReadResult:
+    """What the read half (extraction + validation) hands to the decide half."""
+    invoice: m.Invoice
+    run: m.ProcessingRun
+    inv: ExtractedInvoice
+    vres: dict
+    checks: list
+    rules: dict
+    llm: LLMClient
+    rn: int
+    today: date
+    stage_errors: list[str] = field(default_factory=list)
+
+
 def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", actor: str = "SYSTEM",
                     llm: LLMClient | None = None, today: date | None = None) -> m.ProcessingRun:
+    """Read then decide one invoice. Batches use read_invoice / decide_invoice separately so several
+    invoices are read in parallel while decisions stay in upload order (see jobs.process_many)."""
+    res = read_invoice(db, invoice_id, trigger, actor, llm, today)
+    return decide_invoice(db, res) if isinstance(res, ReadResult) else res
+
+
+def _fail(db: Session, invoice_id: int, rn: int, e: Exception) -> None:
+    db.rollback()
+    invoice = db.get(m.Invoice, invoice_id)
+    if isinstance(e, DocumentError):
+        invoice.status, invoice.stage, invoice.error = "FAILED", "FAILED", e.message
+        log(db, invoice.id, "PROCESSING_FAILED", e.message, {"code": e.code}, rn)
+    else:
+        log_.exception("pipeline failed")
+        invoice.status, invoice.stage, invoice.error = "FAILED", "FAILED", f"Unexpected error: {e}"
+        log(db, invoice.id, "PROCESSING_FAILED", f"Unexpected error: {e}", {"trace": traceback.format_exc()[-2000:]}, rn)
+    db.commit()
+
+
+def read_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", actor: str = "SYSTEM",
+                 llm: LLMClient | None = None, today: date | None = None) -> ReadResult | m.ProcessingRun:
+    """The slow, independent half: extraction (OCR / AI) -> vendor -> validation. Safe to run for
+    several invoices at once - it only reads master data and writes this invoice's own run.
+    Returns a ReadResult, or the run (already marked FAILED) when the document cannot be processed."""
     settings = get_settings()
     llm = llm or LLMClient()
     today = today or date.today()
@@ -237,23 +277,25 @@ def process_invoice(db: Session, invoice_id: int, trigger: str = "INITIAL", acto
             + (f" Vendor: {vres['vendor']['name']} via {vres['method']}." if vres["vendor"] else " Vendor not identified."),
             {"failed": [c.code for c in fails]}, rn)
         _stage(db, invoice, "MATCHING")
+        return ReadResult(invoice=invoice, run=run, inv=inv, vres=vres, checks=checks, rules=rules, llm=llm, rn=rn,
+                          today=today, stage_errors=stage_errors)
+    except Exception as e:  # noqa: BLE001 - DocumentError and anything unexpected end the run as FAILED
+        _fail(db, invoice_id, rn, e)
+        return run
+
+
+def decide_invoice(db: Session, r: ReadResult, summarise: bool = True):
+    """The fast, order-sensitive half: PO matching -> duplicates -> controls -> decision -> ledger.
+    Runs for one invoice at a time (LedgerSection), in upload order within a batch. With summarise=False
+    it returns the facts for summarise_invoice (which a batch runs in parallel), else the finished run."""
+    try:
         with LedgerSection(db):
-            return _match_decide_record(db, invoice, run, inv, vres, checks, rules, llm, stage_errors, rn, today)
-    except DocumentError as e:
-        db.rollback()
-        invoice = db.get(m.Invoice, invoice_id)
-        invoice.status, invoice.stage, invoice.error = "FAILED", "FAILED", e.message
-        log(db, invoice.id, "PROCESSING_FAILED", e.message, {"code": e.code}, rn)
-        db.commit()
-        return run
+            run, facts = _match_decide_record(db, r.invoice, r.run, r.inv, r.vres, r.checks, r.rules, r.llm,
+                                              r.stage_errors, r.rn, r.today)
     except Exception as e:  # noqa: BLE001
-        log_.exception("pipeline failed")
-        db.rollback()
-        invoice = db.get(m.Invoice, invoice_id)
-        invoice.status, invoice.stage, invoice.error = "FAILED", "FAILED", f"Unexpected error: {e}"
-        log(db, invoice.id, "PROCESSING_FAILED", f"Unexpected error: {e}", {"trace": traceback.format_exc()[-2000:]}, rn)
-        db.commit()
-        return run
+        _fail(db, r.invoice.id, r.rn, e)
+        return r.run if summarise else None
+    return summarise_invoice(db, r, facts) if summarise else facts
 
 
 def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, inv: ExtractedInvoice, vres: dict,
@@ -408,12 +450,29 @@ def _match_decide_record(db: Session, invoice: m.Invoice, run: m.ProcessingRun, 
                                   for i in controls["issues"]],
              "tds": controls["tds"].get("message"),
              "original_invoice": (note_info or {}).get("original")}
-    run.ai_summary = ai_summary(llm, facts)
-    if run.ai_summary and run.ai_summary.get("text"):
-        log(db, invoice.id, "AI_SUMMARY_GENERATED", "AI summary generated (labelled as AI output).", {}, rn)
-    run.llm_calls = llm.calls
+    # The decision is final from here on: mark the invoice PROCESSED now (duplicate checks and credit-note
+    # lookups of the NEXT invoice only see processed invoices), and write the AI summary afterwards,
+    # outside the ledger lock, so slow AI calls never hold up the next invoice's decision.
+    invoice.status = "PROCESSED"
+    run.llm_calls = list(llm.calls)
+    db.commit()
+    return run, facts
+
+
+def summarise_invoice(db: Session, r: ReadResult, facts: dict) -> m.ProcessingRun:
+    """AI summary + recommendation for a decided invoice; runs outside the ledger lock (in parallel for
+    batches). A failure here never changes the decision - the run simply has no AI summary."""
+    run, invoice = r.run, r.invoice
+    try:
+        run.ai_summary = ai_summary(r.llm, facts)
+        if run.ai_summary and run.ai_summary.get("text"):
+            log(db, invoice.id, "AI_SUMMARY_GENERATED", "AI summary generated (labelled as AI output).", {}, r.rn)
+    except Exception:  # noqa: BLE001
+        log_.exception("AI summary failed for invoice %s", invoice.id)
+        db.rollback()
+    run.llm_calls = list(r.llm.calls)
     run.finished_at = datetime.now(timezone.utc)
-    invoice.status, invoice.stage = "PROCESSED", "DONE"
+    invoice.stage = "DONE"
     db.commit()
     return run
 

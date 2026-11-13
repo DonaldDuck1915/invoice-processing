@@ -74,6 +74,16 @@ Also included: cancelled PO (reject), PO belonging to another vendor (reject), b
 - **Interrupted runs resume**: invoices left mid-processing by a restart (e.g. the free host sleeping) are re-queued at startup.
 - **Hardening**: rule overrides are type- and range-checked (policies must be MANUAL_REVIEW/REJECT, weights must add up to 1); repeated failed sign-ins are throttled; a hosted (Postgres) instance refuses to start with the demo `AUTH_SECRET`; `ALLOW_DEMO_RESET=false` disables the reset button.
 
+## Throughput: parallel reading, ordered decisions
+
+Processing is split in two halves:
+
+- **Read** (OCR, AI extraction, vendor, validation) - slow, mostly waiting on OCR or the AI, and independent per invoice. Up to `READ_CONCURRENCY` invoices (default 3) are read at the same time.
+- **Decide** (PO matching, duplicates, AP controls, decision, ledger) - milliseconds, but order-sensitive: split invoices (60 + 40 + 5 chairs) and duplicates must be judged against what was decided before them. A batch decides its invoices one by one **in upload order**, each as soon as it and everything before it has been read.
+- The **AI summary** is written after the decision is saved, outside the ledger lock and in parallel, so a slow AI call never holds up the next invoice's decision.
+
+All OpenAI requests share one cap (`OPENAI_MAX_CONCURRENCY`, default 4) and can be paced to the account's requests-per-minute (`OPENAI_REQUESTS_PER_MINUTE`). A rate limit (429) is retried with exponential back-off and jitter, honouring `Retry-After` (`OPENAI_MAX_RETRIES`, default 3); an overloaded model (5xx) switches to the fallback model or is retried when there is none; a timeout is never waited out twice. Measured with the real AI on 6 sample invoices: **31.9 s one at a time -> 12.6 s with 3 in parallel**, identical decisions.
+
 ## Guest mode (for evaluators)
 
 The sign-in page has **Continue as guest**. Each guest gets a **private sandbox**: a fresh copy of the demo vendors and purchase orders, plus the sample invoices on the *Process invoices* page. Their uploads, reviews, rule changes and profile are invisible to everyone else and never touch the real data, so several evaluators can test at the same time without seeing each other's duplicates or used-up PO balances.

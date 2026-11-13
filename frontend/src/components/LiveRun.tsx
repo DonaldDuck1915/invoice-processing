@@ -19,6 +19,8 @@ export const STAGES = [
 ] as const;
 
 const ACTIVE = ["RECEIVED", "PROCESSING"];
+// The decision is saved (status PROCESSED) before the AI summary is written, so "SUMMARISING" still runs.
+const isActive = (inv: any) => ACTIVE.includes(inv.status) || inv.stage === "SUMMARISING";
 
 type Progress = { invoice: any; events: any[]; run_no: number | null; started_at?: string; finished_at?: string };
 
@@ -34,7 +36,7 @@ export function useProgress(invoiceId: number | string | null, intervalMs = 700)
         const p = await api.get<Progress>(`/invoices/${invoiceId}/progress`);
         if (stopped) return;
         setData(p);
-        if (ACTIVE.includes(p.invoice.status)) timer.current = window.setTimeout(tick, intervalMs);
+        if (isActive(p.invoice)) timer.current = window.setTimeout(tick, intervalMs);
       } catch (e) { if (!stopped) setError(e); }
     };
     tick();
@@ -44,7 +46,7 @@ export function useProgress(invoiceId: number | string | null, intervalMs = 700)
 }
 
 function stageIndex(stage: string | null | undefined, status: string) {
-  if (status === "PROCESSED" || stage === "DONE") return STAGES.length;
+  if (stage === "DONE" || (status === "PROCESSED" && stage !== "SUMMARISING")) return STAGES.length;
   const i = STAGES.findIndex((s) => s.id === stage);
   return i < 0 ? 0 : i;
 }
@@ -70,7 +72,7 @@ export default function LiveRun({ invoiceId, compact = false }: { invoiceId: num
       <ol className="relative space-y-0">
         {STAGES.map((s, i) => {
           const done = i < current;
-          const active = !failed && i === current && ACTIVE.includes(inv.status);
+          const active = !failed && i === current && isActive(inv);
           const broke = failed && i === current;
           const evs = data.events.filter((e) => (s.events as readonly string[]).includes(e.event_type));
           return (

@@ -110,7 +110,7 @@ def test_reasoning_rejected_is_retried_without_it():
     (api_error(openai.NotFoundError, 404, "model not found"), "OPENAI_MODEL"),
 ])
 def test_errors_are_explained(error, message):
-    c = client_with(error)
+    c = client_with(error, openai_max_retries=0)   # retries of rate limits: see test_ai_throughput.py
     with pytest.raises(LLMUnavailable, match=message):
         c.json_call("extraction", "s", [{"type": "text", "text": "t"}], SCHEMA)
     assert len(c._openai.responses.calls) == 1  # not retried on another model: it would not help

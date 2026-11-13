@@ -7,6 +7,7 @@ _tmp = tempfile.mkdtemp(prefix="invoice-ai-test-")
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{_tmp}/test.db"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["SEED_ON_STARTUP"] = "false"
+os.environ["OPENAI_BACKOFF_SECONDS"] = "0"   # retries in tests do not actually wait
 os.environ["GUEST_DATA_DIR"] = os.path.join(_tmp, "guest_data")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

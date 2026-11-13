@@ -64,7 +64,7 @@ def engine_for(ws: str | None) -> Engine:
             else:
                 path = _sqlite_path(ws)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                eng = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+                eng = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False, "timeout": 30})
             _engines[ws] = eng
         return eng
 

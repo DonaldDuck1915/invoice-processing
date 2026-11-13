@@ -34,7 +34,14 @@ class Settings(BaseSettings):
     # auto: skip the AI reader for clean digital invoices (all critical fields read, every total
     # reconciles); always: send every invoice to the AI reader
     ai_extraction: str = "auto"
-    llm_timeout_seconds: float = 60.0     # a slow AI call falls back to rules-only instead of stalling a run
+    llm_timeout_seconds: float = 60.0
+    # Throughput: invoices read (OCR / AI) at the same time, and the cap on simultaneous OpenAI requests
+    # across the whole process. Calls that hit a rate limit or a 5xx are retried with exponential back-off.
+    read_concurrency: int = 3
+    openai_max_concurrency: int = 4
+    openai_max_retries: int = 3           # retries per call on 429 (rate limit) / 5xx
+    openai_backoff_seconds: float = 1.0   # first back-off; doubles each retry (plus jitter), capped at 20 s
+    openai_requests_per_minute: int = 0   # 0 = no client-side limit; set to your OpenAI tier's RPM to pace calls     # a slow AI call falls back to rules-only instead of stalling a run
 
     reviewer_username: str = "reviewer"
     reviewer_password: str = "review123"

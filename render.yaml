@@ -23,6 +23,10 @@ services:
         generateValue: true
       - key: LLM_TIMEOUT_SECONDS
         value: "60"
+      - key: READ_CONCURRENCY
+        value: "3"
+      - key: OPENAI_MAX_CONCURRENCY
+        value: "4"
       - key: ALLOW_DEMO_RESET
         value: "false"
       - key: OPENAI_API_KEY
