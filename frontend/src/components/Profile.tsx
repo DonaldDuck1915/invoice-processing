@@ -4,7 +4,7 @@ import { api } from "../api";
 import Modal from "./Modal";
 import { ErrorBox } from "./ui";
 
-export type User = { username: string; role: string; name: string; designation?: string; avatar?: string | null };
+export type User = { username: string; role: string; name: string; designation?: string; avatar?: string | null; guest?: boolean };
 
 const initials = (name: string) => name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
 

@@ -36,6 +36,13 @@ async def lifespan(_: FastAPI):
         finally:
             db.close()
     recover_interrupted()
+    # guest sandboxes: drop expired ones, migrate and resume the rest
+    from .workspaces import active_workspaces, migrate_workspaces, sweep_expired
+
+    sweep_expired()
+    migrate_workspaces()
+    for ws in active_workspaces():
+        recover_interrupted(ws)
     start_poller()
     yield
 

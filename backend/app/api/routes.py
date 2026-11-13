@@ -21,7 +21,7 @@ from ..config import deep_merge, get_settings, load_default_rules
 from .. import email_intake
 from ..csv_import import TEMPLATE as CSV_TEMPLATE
 from ..csv_import import parse_procurement_csv
-from ..db import get_db
+from ..workspaces import create_workspace, get_db, sweep_expired
 from ..extraction.parsers import normalize_ref
 from ..extraction.pdf_reader import DocumentError, ocr_available
 from ..ingestion import ingest
@@ -34,7 +34,7 @@ from ..pipeline import (ManagerApprovalRequired, POBalanceExceeded, confirm_po, 
 from ..audit import log as audit_log
 from ..money import supported_currencies
 from ..seed import import_procurement, po_from_dict, seed_demo
-from .auth import check_credentials, current_user, issue_token, user_info, user_role
+from .auth import bearer, check_credentials, current_user, is_guest, issue_token, token_payload, user_info, user_role
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
@@ -102,6 +102,51 @@ def login(body: LoginBody, request: Request, db: Session = Depends(get_db)):
     return {"token": issue_token(body.username), "user": user_info(body.username, db.get(m.UserProfile, body.username))}
 
 
+_guest_starts: dict[str, list[float]] = {}
+
+
+@router.post("/auth/guest")
+def guest_login(request: Request):
+    """'Continue as guest': a private sandbox seeded with the demo data, signed in as a reviewer."""
+    s = get_settings()
+    if not s.guest_mode:
+        err(403, "GUEST_DISABLED", "Guest access is switched off on this instance.")
+    client = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _login_lock:
+        recent = [x for x in _guest_starts.get(client, []) if now - x < 3600]
+        if len(recent) >= s.guest_per_ip_per_hour:
+            err(429, "TOO_MANY_GUESTS", "Too many guest sessions started from this network - try again later "
+                                        "or keep using your current one.")
+        recent.append(now)
+        _guest_starts[client] = recent
+    sweep_expired()
+    db = next(get_db(None))
+    try:
+        live = db.scalar(select(func.count()).select_from(m.GuestWorkspace)) or 0
+    finally:
+        db.close()
+    if live >= s.guest_max_workspaces:
+        err(503, "GUEST_FULL", "All guest sandboxes are in use right now. Please try again later.")
+    ws = create_workspace(client)
+    return {"token": issue_token("guest-reviewer", ws), "user": user_info("guest-reviewer"),
+            "guest": {"expires_hours": s.guest_ttl_hours}}
+
+
+class GuestRoleBody(BaseModel):
+    role: Literal["REVIEWER", "MANAGER"]
+
+
+@router.post("/auth/guest/role")
+def guest_role(body: GuestRoleBody, creds=Depends(bearer), db: Session = Depends(get_db)):
+    """Guests can switch between the reviewer and manager view of their own sandbox."""
+    payload = token_payload(creds.credentials) if creds else None
+    if not payload or not payload.get("w") or not is_guest(payload["u"]):
+        err(403, "NOT_A_GUEST", "Only guest sessions can switch role.")
+    username = "guest-manager" if body.role == "MANAGER" else "guest-reviewer"
+    return {"token": issue_token(username, payload["w"]), "user": user_info(username, db.get(m.UserProfile, username))}
+
+
 @router.get("/auth/me")
 def me(db: Session = Depends(get_db), user: str = Depends(current_user)):
     return user_info(user, db.get(m.UserProfile, user))
@@ -145,7 +190,8 @@ def health(db: Session = Depends(get_db)):
             "ai_model": s.ai_model, "ai_provider": s.ai_provider,
             "ai_fast_model": (s.openai_fast_model or s.openai_model) if s.ai_provider else None,
             "database": "postgresql" if s.database_url.startswith("postgresql") else "sqlite",
-            "email_intake": bool(s.imap_host), "insecure_defaults": s.insecure_defaults}
+            "email_intake": bool(s.imap_host), "insecure_defaults": s.insecure_defaults,
+            "guest_mode": s.guest_mode, "guest_ttl_hours": s.guest_ttl_hours}
 
 
 # ============================================================================ invoices
@@ -172,15 +218,28 @@ def _invoice_summary(inv: m.Invoice) -> dict:
             "updated_at": inv.updated_at}
 
 
+def _guest_quota(db: Session, user: str, adding: int) -> None:
+    """Guests share the AI budget, so each sandbox may hold a limited number of invoices."""
+    if not is_guest(user):
+        return
+    cap = get_settings().guest_max_invoices
+    have = db.scalar(select(func.count()).select_from(m.Invoice)
+                     .where(~m.Invoice.file_sha256.like("historical-%"))) or 0
+    if have + adding > cap:
+        err(429, "GUEST_LIMIT", f"Guest sandboxes hold up to {cap} invoices ({have} uploaded). "
+                                "Use 'Reset demo' on Rules & data to start over.")
+
+
 @router.post("/invoices", status_code=202)
 async def upload_invoice(background: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db),
                          user: str = Depends(current_user)):
+    _guest_quota(db, user, 1)
     data = await _read_upload(file)
     try:
         inv = ingest(db, data, file.filename, file.content_type, user)
     except DocumentError as e:
         err(400, e.code, e.message)
-    background.add_task(process_many, [inv.id], "INITIAL", user)
+    background.add_task(process_many, [inv.id], "INITIAL", user, db.info.get("workspace"))
     return ok(_invoice_summary(inv), 202)
 
 
@@ -194,6 +253,7 @@ async def upload_batch(background: BackgroundTasks, files: list[UploadFile] = Fi
     another (in upload order, so split invoices and duplicates are evaluated in sequence)."""
     if len(files) > MAX_BATCH:
         err(400, "TOO_MANY_FILES", f"Upload at most {MAX_BATCH} files at a time.")
+    _guest_quota(db, user, len(files))
     accepted, rejected = [], []
     for f in files:
         try:
@@ -206,7 +266,7 @@ async def upload_batch(background: BackgroundTasks, files: list[UploadFile] = Fi
         except HTTPException as e:
             rejected.append({"filename": f.filename, **(e.detail if isinstance(e.detail, dict) else {})})
     if accepted:
-        background.add_task(process_many, [a["id"] for a in accepted], "INITIAL", user)
+        background.add_task(process_many, [a["id"] for a in accepted], "INITIAL", user, db.info.get("workspace"))
     return ok({"accepted": accepted, "rejected": rejected}, 202)
 
 
@@ -379,7 +439,8 @@ def reprocess(invoice_id: int, body: ReprocessBody, background: BackgroundTasks,
         err(409, "ALREADY_PROCESSING", "This invoice is already being processed.")
     inv.status, inv.stage = "PROCESSING", "QUEUED"
     db.commit()
-    background.add_task(process_many, [inv.id], "RE_EXTRACT" if body.re_extract else "REPROCESS", user)
+    background.add_task(process_many, [inv.id], "RE_EXTRACT" if body.re_extract else "REPROCESS", user,
+                        db.info.get("workspace"))
     res = invoice_detail(invoice_id, db, user)
     res.status_code = 202
     return res
@@ -728,9 +789,9 @@ def put_rules(body: RulesBody, db: Session = Depends(get_db), user: str = Depend
 
 @router.post("/admin/reset-demo")
 def reset_demo(db: Session = Depends(get_db), user: str = Depends(current_user)):
-    if not get_settings().allow_demo_reset:
+    if not is_guest(user) and not get_settings().allow_demo_reset:
         err(403, "RESET_DISABLED", "Resetting the data is disabled on this instance (ALLOW_DEMO_RESET=false).")
-    return seed_demo(db, reset=True)
+    return seed_demo(db, reset=True)  # a guest's session points at their own sandbox, so only it is reset
 
 
 @router.post("/admin/import-csv")
@@ -760,12 +821,16 @@ def csv_template(user: str = Depends(current_user)):
 @router.get("/admin/email")
 def email_status(user: str = Depends(current_user)):
     s = get_settings()
+    if is_guest(user):
+        return {"enabled": False, "guest": True, "last_error": None, "last_poll": None, "processed": 0}
     return {**email_intake.STATUS, "enabled": bool(s.imap_host), "mailbox": s.imap_user, "folder": s.imap_folder,
             "poll_seconds": s.imap_poll_seconds}
 
 
 @router.post("/admin/email/poll")
 def email_poll(user: str = Depends(current_user)):
+    if is_guest(user):
+        err(403, "GUEST_NOT_ALLOWED", "E-mail intake is not available in guest mode.")
     res = email_intake.poll_once()
     if not res["ok"]:
         err(409 if "configured" in res["error"] or "already" in res["error"] else 502, "EMAIL_POLL_FAILED",

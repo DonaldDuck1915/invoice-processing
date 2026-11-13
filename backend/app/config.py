@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     imap_poll_seconds: int = 60
     imap_max_per_poll: int = 25
 
+    # Guest mode: "Continue as guest" gives each visitor a private sandbox with the demo data.
+    guest_mode: bool = True
+    guest_ttl_hours: int = 24             # a sandbox unused this long is deleted
+    guest_max_workspaces: int = 100       # live sandboxes at once
+    guest_per_ip_per_hour: int = 5        # new sandboxes one client may create per hour
+    guest_max_invoices: int = 150         # uploads per sandbox (each may call the AI)
+    guest_data_dir: str = "./guest_data"  # SQLite only; on Postgres each sandbox is a schema
+
     login_max_attempts: int = 5          # failed logins per client within the window below
     login_window_seconds: int = 300
 

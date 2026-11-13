@@ -72,6 +72,15 @@ Also included: cancelled PO (reject), PO belonging to another vendor (reject), b
 - **Interrupted runs resume**: invoices left mid-processing by a restart (e.g. the free host sleeping) are re-queued at startup.
 - **Hardening**: rule overrides are type- and range-checked (policies must be MANUAL_REVIEW/REJECT, weights must add up to 1); repeated failed sign-ins are throttled; a hosted (Postgres) instance refuses to start with the demo `AUTH_SECRET`; `ALLOW_DEMO_RESET=false` disables the reset button.
 
+## Guest mode (for evaluators)
+
+The sign-in page has **Continue as guest**. Each guest gets a **private sandbox**: a fresh copy of the demo vendors and purchase orders, plus the sample invoices on the *Process invoices* page. Their uploads, reviews, rule changes and profile are invisible to everyone else and never touch the real data, so several evaluators can test at the same time without seeing each other's duplicates or used-up PO balances.
+
+- A switch at the bottom of the sidebar changes between the **reviewer** and **manager** view, so manager-only features (approval limits, vendor bank details) can be tried too.
+- *Rules & data → Reset demo* resets only the guest's own sandbox.
+- Hosted on Postgres, each sandbox is its own schema (`guest_<id>`); locally on SQLite it is a file in `GUEST_DATA_DIR`. A sandbox unused for `GUEST_TTL_HOURS` (24) is deleted.
+- Limits: 5 new sandboxes per client per hour, 100 alive at once, 150 invoices each (guests use the configured OpenAI key, about $0.0008 per invoice). E-mail intake is off for guests. Set `GUEST_MODE=false` to remove the button.
+
 ## Run locally
 
 ```bash

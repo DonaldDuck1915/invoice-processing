@@ -37,3 +37,7 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: GUEST_MODE
+        value: "true"
+      - key: GUEST_TTL_HOURS
+        value: "24"

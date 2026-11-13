@@ -36,6 +36,20 @@ function Shell({ children, user, onLogout, onUser }: { children: ReactNode; user
   const [dragging, setDragging] = useState(false);
   const [editing, setEditing] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
+  const [switching, setSwitching] = useState(false);
+
+  // Guests can look at their sandbox as a reviewer or as a manager; the page reloads so every screen
+  // picks up the new role.
+  async function switchRole(role: "REVIEWER" | "MANAGER") {
+    if (role === user.role) return;
+    setSwitching(true);
+    try {
+      const r = await api.post("/auth/guest/role", { role });
+      auth.set(r.token);
+      onUser(r.user);
+      window.location.reload();
+    } catch { setSwitching(false); }
+  }
   useEffect(() => store(WIDTH_KEY, String(width)), [width]);
   useEffect(() => store(COLLAPSED_KEY, collapsed ? "1" : "0"), [collapsed]);
 
@@ -91,6 +105,22 @@ function Shell({ children, user, onLogout, onUser }: { children: ReactNode; user
 
         {/* profile: always on screen at the bottom of the sidebar */}
         <div className="shrink-0 border-t border-slate-800 p-3">
+          {user.guest && !collapsed && (
+            <div className="mb-2 px-1">
+              <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                <span className="font-semibold uppercase tracking-wide text-indigo-300">Guest sandbox</span>
+                <span className="text-slate-500">private demo data</span>
+              </div>
+              <div className="grid grid-cols-2 rounded-lg bg-slate-800 p-0.5 text-xs" role="group" aria-label="View as">
+                {(["REVIEWER", "MANAGER"] as const).map((r) => (
+                  <button key={r} disabled={switching} onClick={() => switchRole(r)} aria-pressed={user.role === r}
+                    className={`rounded-md py-1.5 font-medium transition ${user.role === r ? "bg-indigo-600 text-white shadow" : "text-slate-300 hover:text-white"}`}>
+                    {r === "REVIEWER" ? "Reviewer" : "Manager"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className={`flex items-center gap-1 ${collapsed ? "flex-col" : ""}`}>
             <button onClick={() => setEditing(true)} title="Edit profile"
               className={`group flex min-w-0 flex-1 items-center gap-3 rounded-xl p-2 text-left transition hover:bg-slate-800 ${collapsed ? "justify-center" : ""}`}>
@@ -118,6 +148,12 @@ function Shell({ children, user, onLogout, onUser }: { children: ReactNode; user
         <span className="font-semibold text-sm flex items-center gap-2"><HiOutlineDocumentSearch className="h-5 w-5 text-indigo-300" />Invoice AI</span>
         <div className="flex items-center gap-3 text-xs">
           {NAV.slice(0, 3).map((n) => <NavLink key={n.to} to={n.to} end={n.end}>{n.label.split(" ")[0]}</NavLink>)}
+          {user.guest && (
+            <button disabled={switching} onClick={() => switchRole(user.role === "MANAGER" ? "REVIEWER" : "MANAGER")}
+              className="rounded-md bg-indigo-600 px-2 py-1 font-medium" title="Switch guest role">
+              {user.role === "MANAGER" ? "Manager" : "Reviewer"} ⇄
+            </button>
+          )}
           <button onClick={() => setEditing(true)} title="Edit profile"><Avatar user={user} size="h-7 w-7" text="text-[10px]" /></button>
           <button onClick={() => setConfirmLogout(true)} title="Sign out"><LogOut className="h-4 w-4" /></button>
         </div>
@@ -131,7 +167,9 @@ function Shell({ children, user, onLogout, onUser }: { children: ReactNode; user
       {editing && <ProfileDialog user={user} onClose={() => setEditing(false)} onSaved={onUser} />}
       {confirmLogout && (
         <Modal title="Sign out?" onClose={() => setConfirmLogout(false)} width="max-w-sm">
-          <p className="text-sm text-slate-600">You will need to sign in again to review invoices.</p>
+          <p className="text-sm text-slate-600">{user.guest
+            ? "This ends your guest session. Your sandbox cannot be reopened after signing out; \"Continue as guest\" starts a fresh one."
+            : "You will need to sign in again to review invoices."}</p>
           <div className="mt-5 flex justify-end gap-2">
             <button className="btn-secondary" onClick={() => setConfirmLogout(false)} autoFocus>Cancel</button>
             <button className="btn bg-rose-600 text-white hover:bg-rose-700" onClick={() => { setConfirmLogout(false); onLogout(); }}>

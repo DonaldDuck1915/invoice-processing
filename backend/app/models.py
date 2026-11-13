@@ -214,3 +214,12 @@ class UserProfile(Base):
     designation: Mapped[str | None] = mapped_column(String(80))
     avatar: Mapped[str | None] = mapped_column(Text)   # small data:image/... URL, resized in the browser
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class GuestWorkspace(Base):
+    """Registry (main database) of guest sandboxes; each one's data lives in its own schema / file."""
+    __tablename__ = "guest_workspaces"
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    client: Mapped[str | None] = mapped_column(String(64))           # IP that created it (rate limiting)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

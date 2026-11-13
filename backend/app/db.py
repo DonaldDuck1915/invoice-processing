@@ -49,22 +49,25 @@ def init_db() -> None:
     add_missing_columns()
 
 
-def add_missing_columns() -> list[str]:
+def add_missing_columns(eng=None, schema: str | None = None) -> list[str]:
     """Light-weight migration: add the nullable columns newer models define but an existing database
-    (created by an older version of the app) lacks. Never drops or changes existing columns."""
+    (created by an older version of the app) lacks. Never drops or changes existing columns.
+    `schema` is a Postgres schema (guest workspaces); `eng` defaults to the main engine."""
     from sqlalchemy import inspect, text
 
+    eng = eng if eng is not None else engine
     added = []
-    insp = inspect(engine)
-    with engine.begin() as conn:
+    insp = inspect(eng)
+    prefix = f'"{schema}".' if schema else ""
+    with eng.begin() as conn:
         for table in Base.metadata.sorted_tables:
-            if not insp.has_table(table.name):
+            if not insp.has_table(table.name, schema=schema):
                 continue
-            have = {c["name"] for c in insp.get_columns(table.name)}
+            have = {c["name"] for c in insp.get_columns(table.name, schema=schema)}
             for col in table.columns:
                 if col.name in have or col.primary_key:
                     continue
-                ddl = col.type.compile(dialect=engine.dialect)
+                ddl = col.type.compile(dialect=eng.dialect)
                 default = ""
                 if col.default is not None and getattr(col.default, "is_scalar", False):
                     v = col.default.arg
@@ -72,6 +75,6 @@ def add_missing_columns() -> list[str]:
                         default = " DEFAULT " + ("TRUE" if v else "FALSE")
                     elif isinstance(v, str):
                         default = " DEFAULT '" + v.replace("'", "''") + "'"
-                conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {col.name} {ddl}{default}"))
+                conn.execute(text(f"ALTER TABLE {prefix}{table.name} ADD COLUMN {col.name} {ddl}{default}"))
                 added.append(f"{table.name}.{col.name}")
     return added
